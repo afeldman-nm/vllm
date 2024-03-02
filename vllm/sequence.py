@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Union
 
 from vllm.block import LogicalTokenBlock
-from vllm.prefix import Prefix
 from vllm.sampling_params import SamplingParams
 from vllm.lora.request import LoRARequest
 
@@ -174,6 +173,16 @@ class Sequence:
     def lora_int_id(self) -> int:
         return self.lora_request.lora_int_id if self.lora_request else 0
 
+    # TODO The current hashing function is O(L^2). We should optimize this in
+    # the future.
+    def hash_of_block(self, logical_idx: int) -> int:
+        # Compute the number of tokens in the sequence
+        num_tokens = self.num_hashed_tokens_of_block(logical_idx)
+        return hash(tuple(self.data.get_token_ids()[0:num_tokens]))
+
+    def num_hashed_tokens_of_block(self, logical_idx: int):
+        return logical_idx * self.block_size + self.block_size
+
     def _append_logical_block(self) -> None:
         block = LogicalTokenBlock(
             block_number=len(self.logical_token_blocks),
@@ -278,7 +287,6 @@ class SequenceGroup:
         sampling_params: The sampling parameters used to generate the outputs.
         arrival_time: The arrival time of the request.
         lora_request: LoRA request.
-        prefix: The prefix of the prompt of the sequence group.
     """
 
     def __init__(
@@ -288,7 +296,6 @@ class SequenceGroup:
         sampling_params: SamplingParams,
         arrival_time: float,
         lora_request: Optional[LoRARequest] = None,
-        prefix: Optional[Prefix] = None,
     ) -> None:
         self.request_id = request_id
         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
@@ -299,7 +306,6 @@ class SequenceGroup:
                                       first_token_time=None,
                                       time_in_queue=None)
         self.lora_request = lora_request
-        self.prefix: Optional[Prefix] = prefix
         self.prompt_logprobs: Optional[PromptLogprobs] = None
         self.state = SequenceGroupState()
 
@@ -314,6 +320,10 @@ class SequenceGroup:
         # All sequences in the group should have the same prompt.
         # We use the prompt of an arbitrary sequence.
         return next(iter(self.seqs_dict.values())).data.prompt_token_ids
+
+    @property
+    def block_size(self) -> int:
+        return next(iter(self.seqs_dict.values())).block_size
 
     @property
     def lora_int_id(self) -> int:
@@ -421,7 +431,6 @@ class SequenceGroupMetadata:
             numbers)
         state: Internal state tied to this sequence group.
         lora_request: LoRA request.
-        prefix: The prefix of the prompt of the sequence group.
     """
 
     def __init__(
@@ -432,7 +441,7 @@ class SequenceGroupMetadata:
         sampling_params: SamplingParams,
         block_tables: Dict[int, List[int]],
         lora_request: Optional[LoRARequest] = None,
-        prefix: Optional[Prefix] = None,
+        computed_block_nums: Optional[List[int]] = None,
         state: Optional[SequenceGroupState] = None,
     ) -> None:
         self.request_id = request_id
@@ -441,7 +450,7 @@ class SequenceGroupMetadata:
         self.sampling_params = sampling_params
         self.block_tables = block_tables
         self.lora_request = lora_request
-        self.prefix = prefix
+        self.computed_block_nums = computed_block_nums
         self.state = SequenceGroupState() if state is None else state
 
     @property
