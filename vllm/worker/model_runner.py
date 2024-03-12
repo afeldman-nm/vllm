@@ -157,20 +157,23 @@ class ModelRunner:
             prompt_tokens = seq_data.get_token_ids()
             prompt_len = len(prompt_tokens)
             prompt_lens.append(prompt_len)
-            computed_len = 0
 
-            # NOTE: This only works for oooooooxxx style attention.
-            computed_block_nums = seq_group_metadata.computed_block_nums
-            if computed_block_nums is not None and len(
-                    computed_block_nums) > 0 and self.sliding_window is None:
-                # Prefix is not supported with sliding_window
-                computed_len = len(computed_block_nums) * self.block_size
-                prompt_tokens = prompt_tokens[computed_len:]
-                prefix_block_tables.append(computed_block_nums)
+            computed_len = 0
+            if self.is_encoder_decoder:
+                context_lens.append(1)
             else:
-                prefix_block_tables.append([])
-            # actual prompt lens
-            context_lens.append(computed_len)
+                # NOTE: This only works for oooooooxxx style attention.
+                computed_block_nums = seq_group_metadata.computed_block_nums
+                if computed_block_nums is not None and len(
+                        computed_block_nums) > 0 and self.sliding_window is None:
+                    # Prefix is not supported with sliding_window
+                    computed_len = len(computed_block_nums) * self.block_size
+                    prompt_tokens = prompt_tokens[computed_len:]
+                    prefix_block_tables.append(computed_block_nums)
+                else:
+                    prefix_block_tables.append([])
+                # actual prompt lens
+                context_lens.append(computed_len)
             subquery_lens.append(prompt_len - computed_len)
 
             input_tokens.append(prompt_tokens)
