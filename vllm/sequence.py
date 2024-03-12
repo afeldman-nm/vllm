@@ -158,6 +158,7 @@ class Sequence:
         prompt: str,
         prompt_token_ids: List[int],
         block_size: int,
+        is_encoder_decoder: bool,
         eos_token_id: Optional[int] = None,
         lora_request: Optional[LoRARequest] = None,
     ) -> None:
