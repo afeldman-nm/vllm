@@ -22,8 +22,6 @@
 #include <stdio.h>
 #include <torch/extension.h>
 
-#include <algorithm>
-
 #include "attention_dtypes.h"
 #include "attention_utils.cuh"
 #ifdef ENABLE_FP8_E5M2
