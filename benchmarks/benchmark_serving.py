@@ -56,6 +56,8 @@ def sample_requests(
     dataset_path: str,
     num_requests: int,
     tokenizer: PreTrainedTokenizerBase,
+    max_prompt_len: int = 1024,
+    max_prompt_and_output_len: int = 2048,
 ) -> List[Tuple[str, int, int]]:
     # Load the dataset.
     with open(dataset_path) as f:
@@ -90,7 +92,7 @@ def sample_requests(
             # This is because TGI causes errors when the input or output length
             # is too short.
             continue
-        if prompt_len > 1024 or prompt_len + output_len > 2048:
+        if prompt_len > max_prompt_len or prompt_len + output_len > max_prompt_and_output_len:
             # Prune too long sequences.
             continue
         filtered_dataset.append((prompt, prompt_len, output_len))
@@ -253,7 +255,8 @@ def main(args: argparse.Namespace):
         api_url = f"http://{args.host}:{args.port}{args.endpoint}"
 
     tokenizer = get_tokenizer(tokenizer_id,
-                              trust_remote_code=args.trust_remote_code)
+                              trust_remote_code=args.trust_remote_code,
+                              truncation=True)
     input_requests = sample_requests(args.dataset, args.num_prompts, tokenizer)
 
     benchmark_result = asyncio.run(

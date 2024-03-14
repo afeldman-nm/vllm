@@ -578,6 +578,7 @@ class T5ForConditionalGeneration(nn.Module):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
+
             if "EncDecAttention.relative_attention_bias" in name:
                 continue
 
