@@ -262,6 +262,10 @@ class T5Attention(nn.Module):
 
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
+        print("input_metadata.prompt_lens:",input_metadata.prompt_lens.cpu())
+        print("input_metadata.prompt_lens.max():",input_metadata.prompt_lens.max().cpu())
+        print("input_metadata.prompt_lens.max().item():",input_metadata.prompt_lens.max().cpu().item())
+        print("Cleanup needed! (t5)")
         prompt_len = input_metadata.prompt_lens.max().item()
         context_len = input_metadata.context_lens.max().item()
         context_len = max(context_len, 1)

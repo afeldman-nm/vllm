@@ -51,6 +51,88 @@ class BenchmarkMetrics:
     median_tpot_ms: float
     p99_tpot_ms: float
 
+'''
+def truncate_prompt_text(prompt: str, tokenizer: PreTrainedTokenizerBase, max_prompt_len: int) -> str:
+    """
+    Truncate the prompt text so that its tokenized form is at most max_prompt_len tokens,
+    allowing for a buffer to prevent exceeding this limit upon re-tokenization.
+    """
+    tokens = tokenizer.tokenize(prompt)
+    
+    # Adjust the truncation target to include a buffer
+    truncation_target = max_prompt_len - 1  # Introducing a buffer to avoid overshooting
+    
+    if len(tokens) <= truncation_target:
+        return prompt  # Return as is if within the adjusted limit
+    
+    # Initially truncate to the adjusted target
+    truncated_tokens = tokens[:truncation_target]
+    truncated_text = tokenizer.convert_tokens_to_string(truncated_tokens)
+    
+    # Verify token count upon re-tokenization, adjusting if necessary
+    while len(tokenizer.tokenize(truncated_text)) > max_prompt_len:
+        # Reduce the number of tokens by removing from the end, one at a time
+        truncated_tokens = truncated_tokens[:-1]
+        truncated_text = tokenizer.convert_tokens_to_string(truncated_tokens)
+    
+    return truncated_text
+
+
+def sample_requests(
+    dataset_path: str,
+    num_requests: int,
+    tokenizer: PreTrainedTokenizerBase,
+    max_prompt_len: int = 1024,
+    max_prompt_and_output_len: int = 2048,
+    truncate_long_prompts: bool = False  # New argument to control truncation behavior.
+) -> List[Tuple[str, int, int]]:
+    # Load the dataset.
+    with open(dataset_path) as f:
+        dataset = json.load(f)
+    # Filter out the conversations with less than 2 turns.
+    dataset = [data for data in dataset if len(data["conversations"]) >= 2]
+    # Only keep the first two turns of each conversation.
+    dataset = [(data["conversations"][0]["value"],
+                data["conversations"][1]["value"]) for data in dataset]
+
+    # some of these will be filtered out, so sample more than we need
+    sampled_indices = random.sample(range(len(dataset)), int(num_requests * 1.2))
+    dataset = [dataset[i] for i in sampled_indices]
+
+    # Tokenize the prompts and completions.
+    prompts = [prompt for prompt, _ in dataset]
+    prompt_token_ids = tokenizer(prompts).input_ids
+    completions = [completion for _, completion in dataset]
+    completion_token_ids = tokenizer(completions).input_ids
+    tokenized_dataset = []
+    for i in range(len(dataset)):
+        output_len = len(completion_token_ids[i])
+        tokenized_dataset.append((prompts[i], prompt_token_ids[i], output_len))
+
+    # Filter or truncate too long sequences.
+    filtered_dataset: List[Tuple[str, int, int]] = []
+    for prompt, prompt_token_ids, output_len in tokenized_dataset:
+        prompt_len = len(prompt_token_ids)
+        if prompt_len < 4 or output_len < 4:
+            # Prune too short sequences.
+            continue
+        if prompt_len + output_len > max_prompt_and_output_len:
+            # Prune too long sequences.
+            continue
+        if prompt_len > max_prompt_len:
+            if truncate_long_prompts:
+                # Truncate prompt text to meet the max_prompt_len requirement.
+                truncated_prompt_text = truncate_prompt_text(prompt, tokenizer, max_prompt_len)
+                prompt_len = len(tokenizer(truncated_prompt_text).input_ids)  # Recalculate prompt_len after truncation.
+                prompt = truncated_prompt_text  # Update prompt to the truncated text.
+            else:
+                continue
+        filtered_dataset.append((prompt, prompt_len, output_len))
+
+    # Sample the requests.
+    sampled_requests = random.sample(filtered_dataset, num_requests)
+    return sampled_requests
+'''
 
 def sample_requests(
     dataset_path: str,
