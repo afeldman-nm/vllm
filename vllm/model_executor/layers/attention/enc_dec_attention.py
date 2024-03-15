@@ -56,7 +56,8 @@ class EncoderAttention(EncDecAttention):
             query: Query tensor.
             key: Key tensor.
             value: Value tensor.
-            custom_bias: Custom bias tensor.
+            custom_bias: Custom bias tensor. Set to None if not used
+                (i.e. we are not masking the tokens in any way)
 
         Returns:
             Output tensor.
@@ -73,13 +74,6 @@ class EncoderAttention(EncDecAttention):
         query = query.view(batch_size, seq_len, self.num_heads, self.head_size)
         key = key.view(batch_size, seq_len, self.num_heads, self.head_size)
         value = value.view(batch_size, seq_len, self.num_heads, self.head_size)
-        if input_metadata.attn_bias is None:
-            input_metadata.attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                [seq_len] * batch_size)
-
-        # TODO: Commenting it out for now, T5 specific operation (BlockDiagonalCausalMask
-        # cannot be sliced)
-        #input_metadata.attn_bias = input_metadata.attn_bias[:, :, :, :seq_len]
 
         # Normal attention
         out = xops.memory_efficient_attention_forward(

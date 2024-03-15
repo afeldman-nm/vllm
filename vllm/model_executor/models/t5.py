@@ -298,6 +298,8 @@ class T5Attention(nn.Module):
                         input_metadata.prompt_lens[i]:, ] = torch.finfo(
                             input_metadata.attn_bias.dtype).min
 
+            input_metadata.attn_bias = input_metadata.attn_bias[:, :, :, :
+                                                                seq_len]
             attn_output = self.attn(q, k, v, input_metadata)
 
         elif not self.is_cross:
@@ -314,8 +316,10 @@ class T5Attention(nn.Module):
                     position_bias[:, :,-seq_len:, :] \
                         .contiguous()
 
-            key_cache, value_cache = kv_cache
+            input_metadata.attn_bias = input_metadata.attn_bias[:, :, :, :
+                                                                seq_len]
 
+            key_cache, value_cache = kv_cache
             attn_output = self.attn(q, k, v, key_cache, value_cache,
                                     input_metadata)
 
@@ -327,9 +331,13 @@ class T5Attention(nn.Module):
                 assert encoder_hidden_states is not None
                 k, _ = self.k(encoder_hidden_states)
                 v, _ = self.v(encoder_hidden_states)
+                input_metadata.attn_bias = BlockDiagonalCausalMask.from_seqlens(
+                    [seq_len] * batch_size)
                 attn_output = self.attn(q, k, v, key_cache, value_cache,
                                         input_metadata)
             else:
+                input_metadata.attn_bias = BlockDiagonalCausalMask.from_seqlens(
+                    [seq_len] * batch_size)
                 attn_output = self.attn(q, None, None, key_cache, value_cache,
                                         input_metadata)
 
