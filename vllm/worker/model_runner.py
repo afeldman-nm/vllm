@@ -943,9 +943,9 @@ def _make_tensor_with_pad(
     device: Optional[Union[str, torch.device]],
 ) -> torch.Tensor:
     padded_x = [_pad_to_max(x_i, max_len, pad) for x_i in x]
-    print("padded_x:",padded_x)
-    print("len(padded_x):",len(padded_x))
-    print("Cleanup needed! (model_runner)")
+    #print("padded_x:",padded_x)
+    #print("len(padded_x):",len(padded_x))
+    #print("Cleanup needed! (model_runner)")
     return torch.tensor(padded_x, dtype=dtype, device=device)
 
 
