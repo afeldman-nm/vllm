@@ -208,6 +208,7 @@ class ModelRunner:
             # Compute the slot mapping.
             slot_mapping.append([])
             block_table = seq_group_metadata.block_tables[seq_id]
+            print("block_table:",block_table)
             # Mask the [0, start_idx) tokens of the prompt with _PAD_SLOT_ID,
             # where start_idx is max(0, prompt_len - sliding_window).
             # For example, if the prompt len is 10, sliding window is 8, and
