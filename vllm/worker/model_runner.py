@@ -208,6 +208,11 @@ class ModelRunner:
                 slot_mapping.append([_PAD_SLOT_ID] * prompt_len)
                 continue
 
+            print("First slot mapping (loop):")
+            print("- First slot mapping, slot mapping:",slot_mapping)
+            print("- First prompt_len:",prompt_len)
+            print("- PAD_SLOT_ID:",_PAD_SLOT_ID)
+
             # Compute the slot mapping.
             slot_mapping.append([])
             block_table = seq_group_metadata.block_tables[seq_id]
@@ -256,6 +261,11 @@ class ModelRunner:
                 slot_mapping[i].append(block_tables[i][-1] * self.block_size)
 
         max_slot_mapping_len = max_prompt_len + self.is_encoder_decoder
+
+        print("Before slot_mapping construction,")
+        print("max_slot_mapping_len:",max_slot_mapping_len)
+        print("slot_mapping:",slot_mapping)
+
         slot_mapping = _make_tensor_with_pad(slot_mapping,
                                              max_slot_mapping_len,
                                              pad=_PAD_SLOT_ID,
