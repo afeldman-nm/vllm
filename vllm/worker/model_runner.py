@@ -298,6 +298,11 @@ class ModelRunner:
             use_cuda_graph=False,
             kv_cache_dtype=self.kv_cache_dtype,
         )
+
+        print((input_tokens, input_positions, input_metadata, prompt_lens,
+                subquery_lens, lora_index_mapping, lora_prompt_mapping,
+                lora_requests))
+
         return (input_tokens, input_positions, input_metadata, prompt_lens,
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
                 lora_requests)
