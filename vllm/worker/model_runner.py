@@ -185,6 +185,12 @@ class ModelRunner:
                 context_lens.append(computed_len)
             subquery_lens.append(prompt_len - computed_len)
 
+            print("computed_len:",computed_len)
+            print("computed_block_nums:",computed_block_nums)
+            print("Prefix block tables:",prefix_block_tables)
+            print("Context lengths:",context_lens)
+            print("Subquery lengths:",subquery_lens)
+
             input_tokens.append(prompt_tokens)
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
