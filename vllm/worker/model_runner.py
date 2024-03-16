@@ -175,6 +175,8 @@ class ModelRunner:
             print("Context lengths:",context_lens)
             print("Subquery lengths:",subquery_lens)
 
+            print("Prompt tokens:",prompt_tokens)
+
             input_tokens.append(prompt_tokens)
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
