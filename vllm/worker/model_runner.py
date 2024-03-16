@@ -226,6 +226,7 @@ class ModelRunner:
             print("- Second slot mapping, slot mapping:",slot_mapping)
             print("- Second start_idx:",start_idx)
             print("- Second self.block_size:",self.block_size)
+            print("- Second prefix_len:",prefix_len)
 
             if self.is_encoder_decoder:
                 block_tables.append(block_table)
