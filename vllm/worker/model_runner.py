@@ -193,6 +193,11 @@ class ModelRunner:
                 slot_mapping.append([_PAD_SLOT_ID] * prompt_len)
                 continue
 
+            print("First slot mapping (loop):")
+            print("- First slot mapping, slot mapping:",slot_mapping)
+            print("- First prompt_len:",prompt_len)
+            print("- PAD_SLOT_ID:",_PAD_SLOT_ID)
+
             # Compute the slot mapping.
             slot_mapping.append([])
             block_table = seq_group_metadata.block_tables[seq_id]
@@ -216,6 +221,11 @@ class ModelRunner:
                 block_offset = i % self.block_size
                 slot = block_number * self.block_size + block_offset
                 slot_mapping[-1].append(slot)
+
+            print("Second slot mapping (loop):")
+            print("- Second slot mapping, slot mapping:",slot_mapping)
+            print("- Second start_idx:",start_idx)
+            print("- Second self.block_size:",self.block_size)
 
             if self.is_encoder_decoder:
                 block_tables.append(block_table)
