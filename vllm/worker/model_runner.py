@@ -237,6 +237,11 @@ class ModelRunner:
                 slot = block_number * self.block_size + block_offset
                 slot_mapping[-1].append(slot)
 
+            print("Second slot mapping (loop):")
+            print("- Second slot mapping, slot mapping:",slot_mapping)
+            print("- Second start_idx:",start_idx)
+            print("- Second self.block_size:",self.block_size)
+
             if self.is_encoder_decoder:
                 block_tables.append(block_table)
                 max_block_table_len = max(max_block_table_len,
