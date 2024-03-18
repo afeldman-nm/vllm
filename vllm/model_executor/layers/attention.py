@@ -367,4 +367,7 @@ def paged_attention(
             custom_bias,
             kv_cache_dtype,
         )
+
+    print("(post) output:",output)
+
     return output
