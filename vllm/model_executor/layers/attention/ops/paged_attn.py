@@ -70,6 +70,26 @@ class PagedAttentionImpl:
         # For context len > 8192, use V2 kernel to avoid shared memory shortage.
         use_v1 = input_metadata.max_context_len <= 8192 and (
             max_num_partitions == 1 or num_seqs * num_heads > 512)
+
+        print("use_v1:",use_v1)
+        print("(pre) output:",output)
+        print("query:",query)
+        print("key_cache:",key_cache)
+        print("value_cache:",value_cache)
+        print("num_kv_heads:",num_kv_heads)
+        print("scale:",scale)
+        print("override_block_tables:",override_block_tables)
+        print("input_metadata.block_tables:",input_metadata.block_tables)
+        print("override_context_lens:",override_context_lens)
+        print("input_metadata.context_lens:",input_metadata.context_lens)
+        print("block_size:",block_size)
+        print("override_max_context_len:",override_max_context_len)
+        print("input_metadata.max_context_len:",input_metadata.max_context_len)
+        print("alibi_slopes:",alibi_slopes)
+        print("apply_attn_bias:",apply_attn_bias)
+        print("attn_bias:",attn_bias)
+        print("input_metadata.kv_cache_dtype:",input_metadata.kv_cache_dtype)
+
         if use_v1:
             # Run PagedAttention V1.
             ops.paged_attention_v1(
@@ -125,6 +145,8 @@ class PagedAttentionImpl:
                 attn_bias if apply_attn_bias else None,
                 input_metadata.kv_cache_dtype,
             )
+
+        print("(post) output:",output)            
         return output
 
     @staticmethod

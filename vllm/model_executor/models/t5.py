@@ -470,6 +470,9 @@ class T5Block(nn.Module):
                                             min=-clamp_value,
                                             max=clamp_value)
 
+            print("hidden_states:",hidden_states)
+            assert(False)
+
         # Apply Feed Forward layer
         hidden_states = self.layer[-1](hidden_states)
 
@@ -552,15 +555,15 @@ class T5ForConditionalGeneration(nn.Module):
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
-        print("forward input_ids:",input_ids)
-        print("kv_caches:",kv_caches)
-        print("input_metadata:",input_metadata)
+        #print("forward input_ids:",input_ids)
+        #print("kv_caches:",kv_caches)
+        #print("input_metadata:",input_metadata)
 
         if input_metadata.is_prompt:
             # prompt run, need to run encoder once
             hidden_states = self.encoder(input_ids, kv_caches, input_metadata,
                                          None)
-            print("hidden_states:",hidden_states)
+            #print("hidden_states:",hidden_states)
 
             # Clear the attention bias
             input_metadata.attn_bias = None
@@ -568,7 +571,7 @@ class T5ForConditionalGeneration(nn.Module):
             input_ids = (torch.ones(batch_size, 1, dtype=torch.long) *
                          self.config.decoder_start_token_id).cuda()
             
-            print("Reshaped input_ids during encoder:",input_ids)
+            #print("Reshaped input_ids during encoder:",input_ids)
 
         else:
             hidden_states = None
@@ -576,7 +579,7 @@ class T5ForConditionalGeneration(nn.Module):
         if kv_caches[0][0] is not None:  # Skip decoder for profiling run
             hidden_states = self.decoder(input_ids, kv_caches, input_metadata,
                                          hidden_states)
-            print("Decoder hidden_states:",hidden_states)
+            #print("Decoder hidden_states:",hidden_states)
 
         if self.config.tie_word_embeddings:
             # Rescale output before projecting on vocab
