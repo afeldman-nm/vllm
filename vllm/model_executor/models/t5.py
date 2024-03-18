@@ -423,6 +423,8 @@ class T5Block(nn.Module):
         input_metadata: InputMetadata,
         encoder_hidden_states: Optional[torch.Tensor],
     ):
+        print("(pre) Hidden states",hidden_states)
+
         hidden_states = self.layer[0](
             hidden_states=hidden_states,
             kv_cache=kv_cache,
@@ -455,6 +457,9 @@ class T5Block(nn.Module):
                 hidden_states = torch.clamp(hidden_states,
                                             min=-clamp_value,
                                             max=clamp_value)
+
+            print("(post) hidden_states:",hidden_states)
+            assert(False)
 
         # Apply Feed Forward layer
         hidden_states = self.layer[-1](hidden_states)
