@@ -1,6 +1,7 @@
 from torch import nn
 import torch
-from typing import List, Tuple, Optional
+from torch import Tensor
+from typing import List, Tuple, Optional, Union
 from transformers import WhisperConfig
 from transformers.activations import GELUActivation
 from vllm.model_executor.input_metadata import InputMetadata
@@ -8,6 +9,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.enc_dec_attention import EncoderAttention, DecoderAttention
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
@@ -16,22 +18,36 @@ from vllm.model_executor.weight_utils import hf_model_weights_iterator, default_
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
 
+class WhisperPositionalEmbedding(nn.Embedding):
+
+    def __init__(self, num_positions: int, embedding_dim: int):
+        super().__init__(num_positions, embedding_dim)
+
+    def forward(self, input_ids, past_key_values_length=0, position_ids=None):
+        if position_ids is None:
+            return self.weight[past_key_values_length:past_key_values_length +
+                               input_ids.shape[1]]
+        else:
+            return self.weight[position_ids]
+
+
 class WhisperAttention(nn.Module):
 
     def __init__(
         self,
         config: WhisperConfig,
         num_heads: int,
-        is_decoder: bool,
+        is_decoder: bool = False,
         bias: bool = True,
         is_cross: bool = False,
     ):
         super().__init__()
         self.d_model = config.d_model
         self.num_heads = num_heads
+        self.is_decoder = is_decoder
+        self.is_cross = is_cross
         self.key_value_proj_dim = self.d_model
         self.head_dim = self.d_model // self.num_heads
-        self.is_decoder = is_decoder
         if (self.head_dim * num_heads) != self.d_model:
             raise ValueError(
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.d_model}"
@@ -51,13 +67,10 @@ class WhisperAttention(nn.Module):
                                           self.d_model,
                                           bias=bias)
 
-        if self.is_decoder or is_cross:
-            raise NotImplementedError("Decoder attention not implemented yet.")
-            """
-            self.attn = DecoderAttention(self.num_heads, self.head_dim, 1)
-            """
+        if self.is_decoder:
+            self.attn = Attention(self.num_heads, self.head_dim, 1)
+
         else:
-            # Encoder attention
             self.attn = EncoderAttention(self.num_heads, self.head_dim, 1)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
@@ -67,8 +80,10 @@ class WhisperAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: Optional[KVCache],
+        kv_cache: Union[Tuple[Tensor, Tensor], None],
         input_metadata: InputMetadata,
+        encoder_hidden_states: Optional[Tensor] = None,
+        
     ) -> torch.Tensor:
 
         bsz, seq_len, _ = hidden_states.size()
@@ -79,23 +94,39 @@ class WhisperAttention(nn.Module):
             # Encoding step. This means that the transformer blocks
             # only employ self-attention and there is no KV cache
             # available to be used
-            if kv_cache[0][0] is not None:
+            if kv_cache is not None:
                 raise ValueError(
                     "Encoder self-attention step. The KV cache should not be populated."
                 )
+            key_cache, value_cache = None, None
+        else:
+            key_cache, value_cache = kv_cache
+            if self.is_cross:
+                if encoder_hidden_states is None:
+                    raise ValueError(
+                        "Decoder cross-attention step. The encoder_hidden_states must be specified"
+                    )
+        if encoder_hidden_states is not None:
+            k, _ = self.k_proj(encoder_hidden_states)
+            v, _ = self.v_proj(encoder_hidden_states)
+        else:
             k, _ = self.k_proj(hidden_states)
             v, _ = self.v_proj(hidden_states)
 
-            # reshape the tensors to the shape required by the EncoderAttention
-            proj_shape = (bsz, -1, self.head_dim * self.num_heads)
-            q = q.reshape(*proj_shape)
-            k = k.reshape(*proj_shape)
-            v = v.reshape(*proj_shape)
-            # the tokens require no masking in the encoder
-            # scenario, setting attn_bias to None
-            input_metadata.attn_bias = None
+        # reshape the tensors to the shape required by the EncoderAttention
+        proj_shape = (bsz, -1, self.head_dim * self.num_heads)
+        q = q.reshape(*proj_shape)
+        k = k.reshape(*proj_shape)
+        v = v.reshape(*proj_shape)
+        # the tokens require no masking in the encoder
+        # scenario, setting attn_bias to None
+        input_metadata.attn_bias = None
+        if kv_cache is None:
             attn_output = self.attn(q, k, v, input_metadata)
-            o, _ = self.out_proj(attn_output)
+        else:
+            attn_output = self.attn(q, k, v, key_cache, value_cache,
+                                    input_metadata)
+        o, _ = self.out_proj(attn_output)
 
         return o
 
@@ -109,8 +140,6 @@ class WhisperEncoderBlock(nn.Module):
         self.self_attn = WhisperAttention(
             config=config,
             num_heads=config.encoder_attention_heads,
-            is_decoder=False,
-            is_cross=False,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.d_model)
         self.activation_fn = GELUActivation()
@@ -121,14 +150,13 @@ class WhisperEncoderBlock(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        kv_cache: Optional[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
 
         residual = hidden_states
 
         hidden_states = self.self_attn_layer_norm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, kv_cache, input_metadata)
+        hidden_states = self.self_attn(hidden_states, None, input_metadata)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -171,7 +199,6 @@ class WhisperEncoder(nn.Module):
     def forward(
         self,
         input_features: torch.Tensor,
-        kv_caches: List[KVCache],
         input_metadata: InputMetadata,
     ) -> torch.Tensor:
 
@@ -191,7 +218,101 @@ class WhisperEncoder(nn.Module):
         hidden_states = inputs_embeds + embed_pos
 
         for enc_block in self.layers:
-            hidden_states = enc_block(hidden_states, kv_caches, input_metadata)
+            hidden_states = enc_block(hidden_states, input_metadata)
+        hidden_states = self.layer_norm(hidden_states)
+        return hidden_states
+
+
+class WhisperDecoderBlock(nn.Module):
+
+    def __init__(self, config: WhisperConfig):
+        super().__init__()
+        self.d_model = config.d_model
+
+        self.self_attn = WhisperAttention(
+            config=config,
+            is_decoder=True,
+            num_heads=config.decoder_attention_heads,
+        )
+
+        self.encoder_attn = WhisperAttention(
+            config=config,
+            is_decoder=True,
+            num_heads=config.decoder_attention_heads,
+            is_cross=True)
+
+        self.activation_fn = GELUActivation()
+
+        self.self_attn_layer_norm = nn.LayerNorm(self.d_model)
+        self.encoder_attn_layer_norm = nn.LayerNorm(self.d_model)
+        self.fc1 = nn.Linear(self.d_model, config.decoder_ffn_dim)
+        self.fc2 = nn.Linear(config.decoder_ffn_dim, self.d_model)
+        self.final_layer_norm = nn.LayerNorm(self.d_model)
+
+    def forward(self, hidden_states: torch.Tensor,
+                encoder_hidden_states: torch.Tensor, kv_cache: Tuple[Tensor,
+                                                                     Tensor],
+                input_metadata: InputMetadata) -> torch.Tensor:
+
+        residual = hidden_states
+        # self-attention
+        hidden_states = self.self_attn_layer_norm(hidden_states)
+        hidden_states = self.self_attn(hidden_states, kv_cache, input_metadata)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        # cross-attention
+        hidden_states = self.encoder_attn_layer_norm(hidden_states)
+        hidden_states = self.encoder_attn(hidden_states, kv_cache,
+                                        input_metadata,
+                                        encoder_hidden_states)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.final_layer_norm(hidden_states)
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
+
+
+class WhisperDecoder(nn.Module):
+
+    def __init__(self, config: WhisperConfig):
+        super().__init__()
+        self.d_model = config.d_model
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, self.d_model,
+                                         config.pad_token_id)
+        self.embed_positions = WhisperPositionalEmbedding(
+            config.max_target_positions, self.d_model)
+        self.layers = nn.ModuleList([
+            WhisperDecoderBlock(config) for _ in range(config.decoder_layers)
+        ])
+        self.layer_norm = nn.LayerNorm(config.d_model)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        kv_cache: List[KVCache],
+        input_metadata: InputMetadata,
+    ) -> torch.Tensor:
+
+        inputs_embeds = self.embed_tokens(input_ids)
+        positions = self.embed_positions(
+            inputs_embeds,
+            past_key_values_length=sum([
+                kv_pairs != (None, None) for kv_pairs in kv_cache if kv_pairs
+            ]),
+        )
+        hidden_states = inputs_embeds + positions
+        for i, dec_block in enumerate(self.layers):
+            hidden_states = dec_block(hidden_states, encoder_hidden_states,
+                                      kv_cache[i], input_metadata)
+
         hidden_states = self.layer_norm(hidden_states)
         return hidden_states
 
@@ -207,6 +328,7 @@ class WhisperForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.encoder = WhisperEncoder(config)
+        self.decoder = WhisperDecoder(config)
         self.sampler = Sampler(config.vocab_size)
 
     def forward(
@@ -234,7 +356,15 @@ class WhisperForConditionalGeneration(nn.Module):
                                        sampling_rate=sample["sampling_rate"],
                                        return_tensors="pt").input_features
             input_features = input_features.to('cuda').bfloat16()
-        return self.encoder(input_features, kv_caches, input_metadata)
+            decoder_input_ids = torch.tensor(
+                [[1]]).to('cuda') * self.config.decoder_start_token_id
+
+        encoder_output = self.encoder(input_features,
+                                      input_metadata=input_metadata)
+        decoder_output = self.decoder(input_ids=decoder_input_ids,
+                                      encoder_hidden_states=encoder_output,
+                                      kv_cache=kv_caches,
+                                      input_metadata=input_metadata)
 
     def sample(self, hidden_states: torch.Tensor,
                sampling_metadata: SamplingMetadata):
@@ -249,15 +379,10 @@ class WhisperForConditionalGeneration(nn.Module):
         revision: Optional[str] = None,
     ):
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        print(params_dict.keys())
-        print('-----------')
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
             name = name.replace("model.", "")
-            if name not in params_dict:
-                print(f"{name} not in params_dict")
-                continue
-            #assert name in params_dict, f"{name} not in params_dict"
+            assert name in params_dict, f"{name} not in params_dict"
             param = params_dict[name]
             assert param.shape == loaded_weight.shape, (
                 f"{name} shape mismatch between model and checkpoint: "
