@@ -387,6 +387,8 @@ class Scheduler:
                 computed_block_nums=self.block_manager.
                 get_common_computed_block_ids(seq_group),
                 state=seq_group.state,
+                audio_sample_request=seq_group.audio_sample_request
+                if scheduler_outputs.prompt_run else None,
             )
             seq_group_metadata_list.append(seq_group_metadata)
         return seq_group_metadata_list, scheduler_outputs

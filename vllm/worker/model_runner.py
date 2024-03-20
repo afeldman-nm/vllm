@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import (DeviceConfig, ModelConfig, LoRAConfig, ParallelConfig,
-                         SchedulerConfig)
+                         SchedulerConfig, AudioFeaturesConfig)
 from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
 from vllm.model_executor.parallel_utils import cupy_utils
@@ -17,7 +17,7 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     with_cupy_nccl_for_all_reduce)
 from vllm.model_executor.parallel_utils import custom_all_reduce
 from vllm.sampling_params import SamplingParams, SamplingType
-from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
+from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata, MultiModalData
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
@@ -42,6 +42,7 @@ class ModelRunner:
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
+        audio_features_config: Optional[AudioFeaturesConfig],
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
     ):
@@ -49,6 +50,7 @@ class ModelRunner:
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.lora_config = lora_config
+        self.audio_features_config = audio_features_config
         self.is_driver_worker = is_driver_worker
 
         # model_config can be None in tests/samplers/test_sampler.py.
@@ -96,11 +98,13 @@ class ModelRunner:
 
     def load_model(self) -> None:
         with measure_cuda_memory() as m:
-            self.model = get_model(self.model_config,
-                                   self.device_config,
-                                   lora_config=self.lora_config,
-                                   parallel_config=self.parallel_config,
-                                   scheduler_config=self.scheduler_config)
+            self.model = get_model(
+                self.model_config,
+                self.device_config,
+                lora_config=self.lora_config,
+                audio_features_config=self.audio_features_config,
+                parallel_config=self.parallel_config,
+                scheduler_config=self.scheduler_config)
 
         self.model_memory_usage = m.consumed_memory
         logger.info(f"Loading model weights took "
@@ -135,10 +139,11 @@ class ModelRunner:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
-               List[int], List[int], Set[LoRARequest]]:
+               List[int], List[int], Set[LoRARequest], "torch.Tensor"]:
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
+        multi_modal_input: List = []
         slot_mapping: List[List[int]] = []
         lora_index_mapping: List[int] = []
         lora_prompt_mapping: List[int] = []
@@ -201,6 +206,10 @@ class ModelRunner:
                 [lora_id] *
                 (prompt_len - computed_len
                  if seq_group_metadata.sampling_params.prompt_logprobs else 1))
+
+            if seq_group_metadata.multi_modal_data:
+                multi_modal_input.append(
+                    seq_group_metadata.multi_modal_data.data)
 
             if seq_group_metadata.block_tables is None:
                 # During memory profiling, the block tables are not initialized
@@ -317,7 +326,7 @@ class ModelRunner:
         )
         return (input_tokens, input_positions, input_metadata, prompt_lens,
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
-                lora_requests)
+                lora_requests, multi_modal_input)
 
     def _prepare_decode(
         self,
@@ -570,7 +579,7 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, SamplingMetadata,
-               Set[int], LoRAMapping]:
+               Set[int], LoRAMapping, "torch.Tensor"]:
         if self.is_driver_worker:
             # NOTE: We assume that all sequences in the group are all prompts or
             # all decodes.
@@ -579,13 +588,15 @@ class ModelRunner:
             if is_prompt:
                 (input_tokens, input_positions, input_metadata, prompt_lens,
                  subquery_lens, lora_index_mapping, lora_prompt_mapping,
-                 lora_requests) = self._prepare_prompt(seq_group_metadata_list)
+                 lora_requests, multi_modal_input
+                 ) = self._prepare_prompt(seq_group_metadata_list)
             else:
                 (input_tokens, input_positions, input_metadata,
                  lora_index_mapping, lora_prompt_mapping,
                  lora_requests) = self._prepare_decode(seq_group_metadata_list)
                 prompt_lens = []
                 subquery_lens = None
+                multi_modal_input = None
             sampling_metadata = self._prepare_sample(seq_group_metadata_list,
                                                      prompt_lens,
                                                      subquery_lens)
@@ -619,6 +630,7 @@ class ModelRunner:
                 sampling_metadata.selected_token_indices,
                 "lora_requests": lora_requests,
                 "lora_mapping": lora_mapping,
+                "multi_modal_input": multi_modal_input,
             }
             broadcast_tensor_dict(metadata_dict, src=0)
         else:
@@ -627,6 +639,7 @@ class ModelRunner:
             input_positions = metadata_dict["input_positions"]
             lora_mapping = metadata_dict["lora_mapping"]
             lora_requests = metadata_dict["lora_requests"]
+            multi_modal_input = metadata_dict["multi_modal_input"]
             input_metadata = InputMetadata(
                 is_prompt=metadata_dict["is_prompt"],
                 slot_mapping=metadata_dict["slot_mapping"],
@@ -650,7 +663,8 @@ class ModelRunner:
             )
 
         return (input_tokens, input_positions, input_metadata,
-                sampling_metadata, lora_requests, lora_mapping)
+                sampling_metadata, lora_requests, lora_mapping,
+                multi_modal_input)
 
     @torch.inference_mode()
     def execute_model(
@@ -659,8 +673,8 @@ class ModelRunner:
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, input_metadata, sampling_metadata,
-         lora_requests,
-         lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
+         lora_requests, lora_mapping, multi_modal_input
+         ) = self.prepare_input_tensors(seq_group_metadata_list)
 
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
@@ -671,12 +685,16 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
-        hidden_states = model_executable(
-            input_ids=input_tokens,
-            positions=input_positions,
-            kv_caches=kv_caches,
-            input_metadata=input_metadata,
-        )
+
+        execute_model_kwargs = {
+            "input_ids": input_tokens,
+            "positions": input_positions,
+            "kv_caches": kv_caches,
+            "input_metadata": input_metadata,
+        }
+        if self.audio_features_config:
+            execute_model_kwargs.update({"input_features": multi_modal_input})
+        hidden_states = model_executable(**execute_model_kwargs)
 
         # Sample the next token.
         output = self.model.sample(
@@ -717,10 +735,12 @@ class ModelRunner:
         # Profile memory usage with max_num_sequences sequences and the total
         # number of tokens equal to max_num_batched_tokens.
         seqs: List[SequenceGroupMetadata] = []
+        # TODO: Look into the profiling of audio features
         for group_id in range(max_num_seqs):
             seq_len = (max_num_batched_tokens // max_num_seqs +
                        (group_id < max_num_batched_tokens % max_num_seqs))
-            seq_data = SequenceData([0] * seq_len)
+            seq_data, fake_multi_modal_input = _prepare_fake_inputs(
+                seq_len, self.audio_features_config)
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
                 is_prompt=True,
@@ -729,6 +749,7 @@ class ModelRunner:
                 block_tables=None,
                 lora_request=dummy_lora_requests_per_seq[group_id]
                 if dummy_lora_requests_per_seq else None,
+                multi_modal_data=fake_multi_modal_input,
             )
             seqs.append(seq)
 
@@ -885,6 +906,7 @@ class CUDAGraphRunner:
                 positions,
                 kv_caches,
                 input_metadata,
+                **kwargs,
             )
         torch.cuda.synchronize()
 
@@ -899,6 +921,7 @@ class CUDAGraphRunner:
                     positions,
                     kv_caches,
                     input_metadata,
+                    **kwargs,
                 )
         torch.cuda.synchronize()
 
@@ -920,6 +943,7 @@ class CUDAGraphRunner:
         positions: torch.Tensor,
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         input_metadata: InputMetadata,
+        **kwargs,
     ) -> torch.Tensor:
         # KV caches are fixed tensors, so we don't need to copy them.
         del kv_caches
@@ -986,3 +1010,22 @@ def _async_h2d(
 ) -> torch.Tensor:
     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
     return t.to(device=target_device, non_blocking=True)
+
+
+def _prepare_fake_inputs(seq_len: int,
+                         audio_features_config: Optional[AudioFeaturesConfig]):
+    """Prepare fake inputs for profile run."""
+    if audio_features_config:
+        prompt_tokens = [0] * seq_len
+        fake_input_features = MultiModalData(
+            type=MultiModalData.Type.FEATURES,
+            data=torch.zeros(seq_len,
+                             audio_features_config.feature_dims,
+                             dtype=torch.float16))
+        fake_multi_modal_inputs = fake_input_features
+    else:
+
+        prompt_tokens = [0] * seq_len
+        fake_multi_modal_inputs = None
+    return SequenceData(
+        prompt_tokens) if prompt_tokens else None, fake_multi_modal_inputs

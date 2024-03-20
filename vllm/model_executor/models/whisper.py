@@ -9,6 +9,7 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
 )
+from vllm.config import AudioFeaturesConfig
 from vllm.model_executor.layers.attention.attention import Attention
 from vllm.model_executor.layers.attention.enc_dec_attention import EncoderAttention, DecoderAttention
 from vllm.model_executor.layers.sampler import Sampler
@@ -83,7 +84,6 @@ class WhisperAttention(nn.Module):
         kv_cache: Union[Tuple[Tensor, Tensor], None],
         input_metadata: InputMetadata,
         encoder_hidden_states: Optional[Tensor] = None,
-        
     ) -> torch.Tensor:
 
         bsz, seq_len, _ = hidden_states.size()
@@ -264,8 +264,8 @@ class WhisperDecoderBlock(nn.Module):
         # cross-attention
         hidden_states = self.encoder_attn_layer_norm(hidden_states)
         hidden_states = self.encoder_attn(hidden_states, kv_cache,
-                                        input_metadata,
-                                        encoder_hidden_states)
+                                          input_metadata,
+                                          encoder_hidden_states)
         hidden_states = residual + hidden_states
 
         residual = hidden_states
@@ -322,6 +322,7 @@ class WhisperForConditionalGeneration(nn.Module):
     def __init__(
         self,
         config: WhisperConfig,
+        audio_features_config: AudioFeaturesConfig,
         linear_method: Optional[
             "LinearMethodBase"] = None  # probably not needed
     ):
@@ -333,31 +334,18 @@ class WhisperForConditionalGeneration(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.FloatTensor,
+        input_features: torch.FloatTensor,
         positions: torch.Tensor,
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        input_features = input_ids
-        # it seems that before we run the actual inference, vLLM runs a forward pass
-        # on initialization (for KV Cache profiling potentially?). This "mock" forward
-        # pass pushes standard tokens through the forward() method. This needs to be
-        # overriden
-        if input_ids.dtype == torch.long:
-            from datasets import load_dataset
-            from transformers import WhisperProcessor
-            processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
-            ds = load_dataset("hf-internal-testing/librispeech_asr_dummy",
-                              "clean",
-                              split="validation")
-            sample = ds[0]["audio"]
-            input_features = processor(sample["array"],
-                                       sampling_rate=sample["sampling_rate"],
-                                       return_tensors="pt").input_features
-            input_features = input_features.to('cuda').bfloat16()
-            decoder_input_ids = torch.tensor(
-                [[1]]).to('cuda') * self.config.decoder_start_token_id
+        if input_ids is None:
+            decoder_input_ids = torch.tensor([[1]]).to(
+                input_features.device) * self.config.decoder_start_token_id
+        else:
+            decoder_input_ids = input_ids
 
         encoder_output = self.encoder(input_features,
                                       input_metadata=input_metadata)
@@ -365,6 +353,7 @@ class WhisperForConditionalGeneration(nn.Module):
                                       encoder_hidden_states=encoder_output,
                                       kv_cache=kv_caches,
                                       input_metadata=input_metadata)
+        return decoder_output
 
     def sample(self, hidden_states: torch.Tensor,
                sampling_metadata: SamplingMetadata):

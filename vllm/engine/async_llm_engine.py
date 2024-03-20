@@ -240,6 +240,7 @@ class _AsyncLLMEngine(LLMEngine):
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        audio_features_request: Optional["torch.Tensor"] = None,
     ) -> None:
         if lora_request is not None and not self.lora_config:
             raise ValueError(f"Got lora_request {lora_request} but LoRA is "
@@ -259,6 +260,7 @@ class _AsyncLLMEngine(LLMEngine):
             sampling_params=sampling_params,
             arrival_time=arrival_time,
             lora_request=lora_request,
+            audio_features_request=audio_features_request,
         )
 
     async def check_health_async(self) -> None:
@@ -481,6 +483,7 @@ class AsyncLLMEngine:
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        audio_features_request: Optional["torch.Tensor"] = None,
     ) -> AsyncStream:
         if self.log_requests:
             shortened_prompt = prompt
@@ -529,7 +532,9 @@ class AsyncLLMEngine:
             sampling_params=sampling_params,
             prompt_token_ids=prompt_token_ids,
             arrival_time=arrival_time,
-            lora_request=lora_request)
+            lora_request=lora_request,
+            audio_features_request=audio_features_request,
+        )
 
         return stream
 
@@ -540,6 +545,7 @@ class AsyncLLMEngine:
         request_id: str,
         prompt_token_ids: Optional[List[int]] = None,
         lora_request: Optional[LoRARequest] = None,
+        audio_features_request: Optional["torch.Tensor"] = None,
     ) -> AsyncIterator[RequestOutput]:
         """Generate outputs for a request.
 
@@ -555,6 +561,8 @@ class AsyncLLMEngine:
             prompt_token_ids: The token IDs of the prompt. If None, we
                 use the tokenizer to convert the prompts to token IDs.
             lora_request: LoRA request to use for generation, if any.
+            audio_features_request: Audio feature tensor per request.
+                See `AudioFeaturesConfig` for more details.
 
         Yields:
             The output `RequestOutput` objects from the LLMEngine for the
@@ -615,6 +623,7 @@ class AsyncLLMEngine:
                 prompt_token_ids=prompt_token_ids,
                 arrival_time=arrival_time,
                 lora_request=lora_request,
+                audio_features_request=audio_features_request,
             )
 
             async for request_output in stream:

@@ -2,7 +2,8 @@ from abc import ABC, abstractmethod
 from typing import Dict, List, Optional
 
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
-                         ParallelConfig, SchedulerConfig, LoRAConfig)
+                         ParallelConfig, SchedulerConfig, LoRAConfig,
+                         AudioFeaturesConfig)
 from vllm.lora.request import LoRARequest
 from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 
@@ -24,6 +25,7 @@ class ExecutorBase(ABC):
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
+        audio_features_config: Optional[AudioFeaturesConfig],
     ) -> None:
         raise NotImplementedError
 

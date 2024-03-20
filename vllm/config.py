@@ -528,6 +528,11 @@ class DeviceConfig:
 
 
 @dataclass
+class AudioFeaturesConfig:
+    feature_dims: int = 3000
+
+
+@dataclass
 class LoRAConfig:
     max_lora_rank: int
     max_loras: int

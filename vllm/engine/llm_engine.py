@@ -6,7 +6,8 @@ from transformers import PreTrainedTokenizer
 import vllm
 from vllm.lora.request import LoRARequest
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
-                         ParallelConfig, SchedulerConfig, LoRAConfig)
+                         ParallelConfig, SchedulerConfig, LoRAConfig,
+                         AudioFeaturesConfig)
 from vllm.core.scheduler import Scheduler, SchedulerOutputs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.executor.executor_base import ExecutorBase
@@ -61,6 +62,7 @@ class LLMEngine:
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
+        audio_features_config: Optional[AudioFeaturesConfig],
         executor_class: Type[ExecutorBase],
         log_stats: bool,
     ) -> None:
@@ -89,6 +91,7 @@ class LLMEngine:
         self.model_config = model_config
         self.cache_config = cache_config
         self.lora_config = lora_config
+        self.audio_features_config = audio_features_config
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.device_config = device_config
@@ -103,7 +106,8 @@ class LLMEngine:
 
         self.model_executor = executor_class(model_config, cache_config,
                                              parallel_config, scheduler_config,
-                                             device_config, lora_config)
+                                             device_config, lora_config,
+                                             audio_features_config)
 
         # Create the scheduler.
         # NOTE: the cache_config here have been updated with the numbers of
@@ -195,6 +199,7 @@ class LLMEngine:
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
+        audio_sample_request: Optional[AudioFeaturesConfig] = None,
     ) -> None:
         """Add a request to the engine's request pool.
 
@@ -268,7 +273,8 @@ class LLMEngine:
 
         # Create the sequence group.
         seq_group = SequenceGroup(request_id, [seq], sampling_params,
-                                  arrival_time, lora_request)
+                                  arrival_time, lora_request,
+                                  audio_sample_request)
 
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
