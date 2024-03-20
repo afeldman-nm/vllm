@@ -15,6 +15,7 @@ from vllm.engine.ray_utils import initialize_ray_cluster, ray
 from vllm.logger import init_logger
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import SamplingParams
+from vllm.sequence import MultiModalData
 
 logger = init_logger(__name__)
 ENGINE_ITERATION_TIMEOUT_S = int(
@@ -240,7 +241,7 @@ class _AsyncLLMEngine(LLMEngine):
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
-        audio_features_request: Optional["torch.Tensor"] = None,
+        multi_modal_data: Optional[MultiModalData] = None,
     ) -> None:
         if lora_request is not None and not self.lora_config:
             raise ValueError(f"Got lora_request {lora_request} but LoRA is "
@@ -260,7 +261,7 @@ class _AsyncLLMEngine(LLMEngine):
             sampling_params=sampling_params,
             arrival_time=arrival_time,
             lora_request=lora_request,
-            audio_features_request=audio_features_request,
+            multi_modal_data=multi_modal_data,
         )
 
     async def check_health_async(self) -> None:
@@ -483,7 +484,7 @@ class AsyncLLMEngine:
         prompt_token_ids: Optional[List[int]] = None,
         arrival_time: Optional[float] = None,
         lora_request: Optional[LoRARequest] = None,
-        audio_features_request: Optional["torch.Tensor"] = None,
+        multi_modal_data: Optional[MultiModalData] = None,
     ) -> AsyncStream:
         if self.log_requests:
             shortened_prompt = prompt
@@ -533,8 +534,7 @@ class AsyncLLMEngine:
             prompt_token_ids=prompt_token_ids,
             arrival_time=arrival_time,
             lora_request=lora_request,
-            audio_features_request=audio_features_request,
-        )
+            multi_modal_data=multi_modal_data)
 
         return stream
 
@@ -545,7 +545,7 @@ class AsyncLLMEngine:
         request_id: str,
         prompt_token_ids: Optional[List[int]] = None,
         lora_request: Optional[LoRARequest] = None,
-        audio_features_request: Optional["torch.Tensor"] = None,
+        multi_modal_data: Optional[MultiModalData] = None,
     ) -> AsyncIterator[RequestOutput]:
         """Generate outputs for a request.
 
@@ -561,9 +561,7 @@ class AsyncLLMEngine:
             prompt_token_ids: The token IDs of the prompt. If None, we
                 use the tokenizer to convert the prompts to token IDs.
             lora_request: LoRA request to use for generation, if any.
-            audio_features_request: Audio feature tensor per request.
-                See `AudioFeaturesConfig` for more details.
-
+            multi_modal_data: Multi modal data per request, if any.
         Yields:
             The output `RequestOutput` objects from the LLMEngine for the
             request.

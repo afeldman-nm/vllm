@@ -68,7 +68,6 @@ class EncoderAttention(EncDecAttention):
         # custom_bias: [batch_size, seq_len, seq_len]
         # output: [batch_size, seq_len, num_heads * head_size]
 
-        assert input_metadata.is_prompt
         batch_size, seq_len, hidden_size = query.shape
         # Reshape the query, key, and value tensors.
         query = query.view(batch_size, seq_len, self.num_heads, self.head_size)

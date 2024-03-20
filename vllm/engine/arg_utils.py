@@ -61,7 +61,7 @@ class EngineArgs:
 
         # NOTE: If you update any of the arguments below, please also
         # make sure to update docs/source/models/engine_args.rst
-
+        # TODO: Add Whisper-specific arguments maybe
         # Model arguments
         parser.add_argument(
             '--model',
@@ -333,7 +333,8 @@ class EngineArgs:
             lora_dtype=self.lora_dtype,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
-        audio_features_config = AudioFeaturesConfig()
+        audio_features_config = AudioFeaturesConfig(
+        )  #TODO: For now is default
         return (model_config, cache_config, parallel_config, scheduler_config,
                 device_config, lora_config, audio_features_config)
 

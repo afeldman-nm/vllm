@@ -22,6 +22,6 @@ sample = ds[0]["audio"]
 input_features = processor(sample["array"],
                            sampling_rate=sample["sampling_rate"],
                            return_tensors="pt").input_features
-
+print(input_features.shape)
 # generate token ids
 predicted_ids = model.generate(input_features)

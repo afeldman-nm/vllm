@@ -143,7 +143,7 @@ class ModelRunner:
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
-        multi_modal_input: List = []
+        multi_modal_inputs: List = []
         slot_mapping: List[List[int]] = []
         lora_index_mapping: List[int] = []
         lora_prompt_mapping: List[int] = []
@@ -208,7 +208,7 @@ class ModelRunner:
                  if seq_group_metadata.sampling_params.prompt_logprobs else 1))
 
             if seq_group_metadata.multi_modal_data:
-                multi_modal_input.append(
+                multi_modal_inputs.append(
                     seq_group_metadata.multi_modal_data.data)
 
             if seq_group_metadata.block_tables is None:
@@ -278,6 +278,12 @@ class ModelRunner:
         context_lens_tensor = torch.tensor(context_lens,
                                            dtype=torch.int,
                                            device=self.device)
+
+        if multi_modal_inputs:
+            multi_modal_input = torch.stack(multi_modal_inputs).to('cuda')
+        else:
+            multi_modal_input = None
+
         if self.is_encoder_decoder:
             padded_block_tables = []
             # Pad the encoder block tables to the same length
@@ -813,6 +819,14 @@ class ModelRunner:
         slot_mapping.fill_(_PAD_SLOT_ID)
         context_lens = torch.ones(max_batch_size, dtype=torch.int32).cuda()
         block_tables = torch.from_numpy(self.graph_block_tables).cuda()
+        kwargs = {}
+        if self.audio_features_config:
+            fake_multi_modal_input = torch.zeros(
+                max_batch_size,
+                self.audio_features_config.feature_dims,
+                self.audio_features_config.sequence_length,
+                dtype=torch.float32).cuda()
+            kwargs["input_features"] = fake_multi_modal_input
 
         graph_batch_size = _get_graph_batch_size(
             self.scheduler_config.max_num_seqs)
@@ -858,6 +872,7 @@ class ModelRunner:
                     kv_caches,
                     input_metadata,
                     memory_pool=self.graph_memory_pool,
+                    **kwargs,
                 )
                 self.graph_memory_pool = graph_runner.graph.pool()
                 self.graph_runners[batch_size] = graph_runner
@@ -895,6 +910,7 @@ class CUDAGraphRunner:
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         memory_pool,
+        **kwargs,
     ) -> None:
         assert self.graph is None
         # Run the model once without capturing the graph.
@@ -902,10 +918,10 @@ class CUDAGraphRunner:
         # kernel launches for initial benchmarking (e.g., Triton autotune).
         with _maybe_cupy_nccl():
             self.model(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
+                input_ids=input_ids,
+                positions=positions,
+                kv_caches=kv_caches,
+                input_metadata=input_metadata,
                 **kwargs,
             )
         torch.cuda.synchronize()
@@ -1019,13 +1035,12 @@ def _prepare_fake_inputs(seq_len: int,
         prompt_tokens = [0] * seq_len
         fake_input_features = MultiModalData(
             type=MultiModalData.Type.FEATURES,
-            data=torch.zeros(seq_len,
-                             audio_features_config.feature_dims,
-                             dtype=torch.float16))
+            data=torch.zeros(audio_features_config.feature_dims,
+                             audio_features_config.sequence_length,
+                             dtype=torch.float32))
         fake_multi_modal_inputs = fake_input_features
     else:
 
         prompt_tokens = [0] * seq_len
         fake_multi_modal_inputs = None
-    return SequenceData(
-        prompt_tokens) if prompt_tokens else None, fake_multi_modal_inputs
+    return SequenceData(prompt_tokens), fake_multi_modal_inputs

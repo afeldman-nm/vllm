@@ -529,7 +529,8 @@ class DeviceConfig:
 
 @dataclass
 class AudioFeaturesConfig:
-    feature_dims: int = 3000
+    feature_dims: int = 80
+    sequence_length: int = 3000
 
 
 @dataclass

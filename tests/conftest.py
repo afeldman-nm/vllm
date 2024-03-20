@@ -4,7 +4,7 @@ from typing import List, Optional, Tuple
 import pytest
 import torch
 from transformers import AutoModelForCausalLM, WhisperForConditionalGeneration, AutoProcessor
-
+from vllm.sequence import MultiModalData
 from vllm import LLM, SamplingParams
 from vllm.transformers_utils.tokenizer import get_tokenizer
 
@@ -214,8 +214,19 @@ class VllmRunner:
         sampling_params: SamplingParams,
         audio_samples: Optional["TODO"] = None,
     ) -> List[Tuple[List[int], str]]:
+        if audio_samples:
+            assert len(prompts) == len(audio_samples)
+            processor = AutoProcessor.from_pretrained("openai/whisper-tiny")
+            input_features = processor(
+                audio_samples[0]["array"],
+                sampling_rate=audio_samples[0]["sampling_rate"],
+                return_tensors="pt").input_features
+            multi_modal_data = MultiModalData(type=input_features.dtype,
+                                              data=input_features[0])
+        else:
+            multi_modal_data = None
         req_outputs = self.model.generate(prompts,
-                                          audio_samples=audio_samples,
+                                          multi_modal_data=multi_modal_data,
                                           sampling_params=sampling_params)
         outputs = []
         for req_output in req_outputs:
