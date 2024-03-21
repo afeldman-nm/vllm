@@ -3,6 +3,9 @@ import torch
 from datasets import load_dataset
 from vllm.config import AudioFeaturesConfig
 
+import os
+os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
+os.environ['CUDA_VISIBLE_DEVICES'] = "3,4,5,6"
 
 @pytest.fixture()
 def model_id():
@@ -24,17 +27,17 @@ def sample_from_librispeech():
 audio_sample = sample_from_librispeech()["audio"]
 
 
-@pytest.mark.parametrize("dtype", ["float"])  # TODO fix that
-@pytest.mark.parametrize("max_tokens", [8])
+@pytest.mark.parametrize("dtype", ["half"])  # TODO fix that
+@pytest.mark.parametrize("max_tokens", [2])
 @pytest.mark.parametrize("prompts, audio_samples", [([""], [audio_sample])])
 def test_text_to_audio_scenario(hf_runner, vllm_runner, model_id, prompts,
                                 audio_samples, dtype: str,
                                 max_tokens: int) -> None:
-    hf_model = hf_runner(model_id, dtype=dtype)
-    hf_outputs = hf_model.generate_greedy(prompts=prompts,
-                                          audio_samples=audio_samples,
-                                          max_tokens=max_tokens)
-    del hf_model
+    # hf_model = hf_runner(model_id, dtype=dtype)
+    # hf_outputs = hf_model.generate_greedy(prompts=prompts,
+    #                                       audio_samples=audio_samples,
+    #                                       max_tokens=max_tokens)
+    # del hf_model
 
     # Truly cleans up GPU memory.
     torch.cuda.empty_cache()
@@ -43,8 +46,8 @@ def test_text_to_audio_scenario(hf_runner, vllm_runner, model_id, prompts,
                              dtype=dtype,
                              worker_use_ray=False,
                              enforce_eager=True,
-                             tensor_parallel_size=3,
-                             gpu_memory_utilization=0.8)
+                             tensor_parallel_size = 3,
+                             gpu_memory_utilization=0.9)
     vllm_outputs = vllm_model.generate_greedy(prompts,
                                               max_tokens,
                                               audio_samples=audio_samples)

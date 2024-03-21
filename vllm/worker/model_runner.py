@@ -1037,7 +1037,7 @@ def _prepare_fake_inputs(seq_len: int,
             type=MultiModalData.Type.FEATURES,
             data=torch.zeros(audio_features_config.feature_dims,
                              audio_features_config.sequence_length,
-                             dtype=torch.float32))
+                             dtype=torch.float16))
         fake_multi_modal_inputs = fake_input_features
     else:
 

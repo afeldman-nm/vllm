@@ -221,6 +221,8 @@ class VllmRunner:
                 audio_samples[0]["array"],
                 sampling_rate=audio_samples[0]["sampling_rate"],
                 return_tensors="pt").input_features
+            # change type of input features
+            input_features = input_features.to(dtype=self.model.llm_engine.model_config.dtype)
             multi_modal_data = MultiModalData(type=input_features.dtype,
                                               data=input_features[0])
         else:
