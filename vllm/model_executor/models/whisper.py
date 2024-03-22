@@ -11,10 +11,12 @@ from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
 )
 from vllm.config import AudioFeaturesConfig
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.layers.attention.enc_dec_attention import EncoderAttention, DecoderAttention, CrossAttention
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.model_executor.weight_utils import hf_model_weights_iterator, default_weight_loader
+from vllm.model_executor.weight_utils import hf_model_weights_iterator, default_weight_loader, load_tensor_parallel_weights
+from vllm.model_executor.parallel_utils.parallel_state import get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
@@ -45,18 +47,19 @@ class WhisperAttention(nn.Module):
     ):
         super().__init__()
         self.d_model = config.d_model
-        self.num_heads = num_heads
+        self.total_num_heads = num_heads
+        self.num_heads = num_heads // get_tensor_model_parallel_world_size()
         self.is_decoder = is_decoder
         self.is_cross = is_cross
         self.key_value_proj_dim = self.d_model
-        self.head_dim = self.d_model // self.num_heads
-        if (self.head_dim * num_heads) != self.d_model:
+        self.head_dim = self.d_model // self.total_num_heads
+        if (self.head_dim * self.total_num_heads) != self.d_model:
             raise ValueError(
                 f"embed_dim must be divisible by num_heads (got `embed_dim`: {self.d_model}"
                 f" and `num_heads`: {num_heads}).")
 
         self.scaling = self.head_dim**-0.5
-        
+
         self.k_proj = ColumnParallelLinear(self.d_model,
                                            self.d_model,
                                            bias=False)
@@ -68,8 +71,7 @@ class WhisperAttention(nn.Module):
                                            bias=bias)
         self.out_proj = RowParallelLinear(self.d_model,
                                           self.d_model,
-                                          bias=bias,
-                                          linear_method=linear_method)
+                                          bias=True)
 
         if self.is_decoder and is_cross:
             self.attn = CrossAttention(self.num_heads, self.head_dim, 1)
@@ -96,41 +98,41 @@ class WhisperAttention(nn.Module):
 
         if self.is_decoder and self.is_cross:
             if encoder_hidden_states is None:
-                    raise ValueError(
-                        "Decoder cross-attention step. The encoder_hidden_states must be specified"
-                    )
+                raise ValueError(
+                    "Decoder cross-attention step. The encoder_hidden_states must be specified"
+                )
             assert kv_cache is not None
             key_cache, value_cache = kv_cache
             k, _ = self.k_proj(encoder_hidden_states)
             v, _ = self.v_proj(encoder_hidden_states)
-             # reshape the tensors to the shape required by the EncoderAttention
+            # reshape the tensors to the shape required by the EncoderAttention
             proj_shape = (bsz, -1, self.head_dim * self.num_heads)
             q = q.reshape(*proj_shape)
             k = k.reshape(*proj_shape)
             v = v.reshape(*proj_shape)
             input_metadata.attn_bias = None
-            
+
             attn_output = self.attn(q, k, v, key_cache, value_cache,
-                        input_metadata)
-            
+                                    input_metadata)
+
         elif self.is_decoder and not self.is_cross:
             key_cache, value_cache = kv_cache
             k, _ = self.k_proj(hidden_states)
             v, _ = self.v_proj(hidden_states)
-             # reshape the tensors to the shape required by the EncoderAttention
+            # reshape the tensors to the shape required by the EncoderAttention
             proj_shape = (bsz, -1, self.head_dim * self.num_heads)
             q = q.reshape(*proj_shape)
             k = k.reshape(*proj_shape)
             v = v.reshape(*proj_shape)
             # from xformers.ops.fmha.attn_bias import BlockDiagonalCausalMask
-            
+
             # input_metadata.attn_bias = BlockDiagonalCausalMask.from_seqlens(
             #         [seq_len] * bsz)
             # input_metadata.attn_bias = input_metadata.attn_bias.materialize((bsz, 1, seq_len, seq_len), device = q.device)
-            
+
             attn_output = self.attn(q, k, v, key_cache, value_cache,
                                     input_metadata)
-            
+
         else:
             # Encoding step. This means that the transformer blocks
             # only employ self-attention and there is no KV cache
@@ -141,7 +143,7 @@ class WhisperAttention(nn.Module):
                 )
             k, _ = self.k_proj(hidden_states)
             v, _ = self.v_proj(hidden_states)
-            
+
             # reshape the tensors to the shape required by the EncoderAttention
             proj_shape = (bsz, -1, self.head_dim * self.num_heads)
             q = q.reshape(*proj_shape)
@@ -149,7 +151,7 @@ class WhisperAttention(nn.Module):
             v = v.reshape(*proj_shape)
             input_metadata.attn_bias = None
             attn_output = self.attn(q, k, v, input_metadata)
-                
+
         o, _ = self.out_proj(attn_output)
 
         return o
@@ -157,7 +159,9 @@ class WhisperAttention(nn.Module):
 
 class WhisperEncoderBlock(nn.Module):
 
-    def __init__(self, config: WhisperConfig, linear_method: Optional[LinearMethodBase] = None):
+    def __init__(self,
+                 config: WhisperConfig,
+                 linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
         self.d_model = config.d_model
 
@@ -168,8 +172,8 @@ class WhisperEncoderBlock(nn.Module):
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.d_model)
         self.activation_fn = GELUActivation()
-        self.fc1 = nn.Linear(self.d_model, config.encoder_ffn_dim)
-        self.fc2 = nn.Linear(config.encoder_ffn_dim, self.d_model)
+        self.fc1 = ColumnParallelLinear(self.d_model, config.encoder_ffn_dim)
+        self.fc2 = RowParallelLinear(config.encoder_ffn_dim, self.d_model)
         self.final_layer_norm = nn.LayerNorm(self.d_model)
 
     def forward(
@@ -187,9 +191,9 @@ class WhisperEncoderBlock(nn.Module):
         residual = hidden_states
 
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
+        hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
 
         hidden_states = residual + hidden_states
 
@@ -198,7 +202,9 @@ class WhisperEncoderBlock(nn.Module):
 
 class WhisperEncoder(nn.Module):
 
-    def __init__(self, config: WhisperConfig, linear_method: Optional[LinearMethodBase] = None):
+    def __init__(self,
+                 config: WhisperConfig,
+                 linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
         self.d_model = config.d_model
         self.num_mel_bins = config.num_mel_bins
@@ -217,7 +223,8 @@ class WhisperEncoder(nn.Module):
         self.embed_positions = nn.Embedding(self.max_source_positions,
                                             self.d_model)
         self.layers = nn.ModuleList([
-            WhisperEncoderBlock(config, linear_method) for i in range(config.encoder_layers)
+            WhisperEncoderBlock(config, linear_method)
+            for i in range(config.encoder_layers)
         ])
         self.layer_norm = nn.LayerNorm(config.d_model)
 
@@ -250,7 +257,9 @@ class WhisperEncoder(nn.Module):
 
 class WhisperDecoderBlock(nn.Module):
 
-    def __init__(self, config: WhisperConfig, linear_method: Optional[LinearMethodBase] = None):
+    def __init__(self,
+                 config: WhisperConfig,
+                 linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
         self.d_model = config.d_model
 
@@ -266,14 +275,15 @@ class WhisperDecoderBlock(nn.Module):
             is_decoder=True,
             num_heads=config.decoder_attention_heads,
             is_cross=True,
-            linear_method=linear_method,)
+            linear_method=linear_method,
+        )
 
         self.activation_fn = GELUActivation()
 
         self.self_attn_layer_norm = nn.LayerNorm(self.d_model)
         self.encoder_attn_layer_norm = nn.LayerNorm(self.d_model)
-        self.fc1 = nn.Linear(self.d_model, config.decoder_ffn_dim)
-        self.fc2 = nn.Linear(config.decoder_ffn_dim, self.d_model)
+        self.fc1 = ColumnParallelLinear(self.d_model, config.decoder_ffn_dim)
+        self.fc2 = RowParallelLinear(config.decoder_ffn_dim, self.d_model)
         self.final_layer_norm = nn.LayerNorm(self.d_model)
 
     def forward(self, hidden_states: torch.Tensor,
@@ -297,9 +307,9 @@ class WhisperDecoderBlock(nn.Module):
 
         residual = hidden_states
         hidden_states = self.final_layer_norm(hidden_states)
-        hidden_states = self.fc1(hidden_states)
+        hidden_states, _ = self.fc1(hidden_states)
         hidden_states = self.activation_fn(hidden_states)
-        hidden_states = self.fc2(hidden_states)
+        hidden_states, _ = self.fc2(hidden_states)
         hidden_states = residual + hidden_states
 
         return hidden_states
@@ -307,16 +317,18 @@ class WhisperDecoderBlock(nn.Module):
 
 class WhisperDecoder(nn.Module):
 
-    def __init__(self, config: WhisperConfig, linear_method: Optional[LinearMethodBase] = None):
+    def __init__(self,
+                 config: WhisperConfig,
+                 linear_method: Optional[LinearMethodBase] = None):
         super().__init__()
         self.d_model = config.d_model
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, self.d_model,
-                                         config.pad_token_id)
+        self.embed_tokens = nn.Embedding(config.vocab_size, self.d_model)
         self.embed_positions = WhisperPositionalEmbedding(
             config.max_target_positions, self.d_model)
         self.layers = nn.ModuleList([
-            WhisperDecoderBlock(config, linear_method=linear_method) for _ in range(config.decoder_layers)
+            WhisperDecoderBlock(config, linear_method=linear_method)
+            for _ in range(config.decoder_layers)
         ])
         self.layer_norm = nn.LayerNorm(config.d_model)
 
@@ -348,8 +360,7 @@ class WhisperForConditionalGeneration(nn.Module):
         self,
         config: WhisperConfig,
         audio_features_config: AudioFeaturesConfig,
-        linear_method: Optional[
-            LinearMethodBase] = None  # probably not needed
+        linear_method: Optional[LinearMethodBase] = None  # probably not needed
     ):
         super().__init__()
         self.config = config
@@ -378,9 +389,9 @@ class WhisperForConditionalGeneration(nn.Module):
             decoder_output = None
         else:
             decoder_output = self.decoder(input_ids=decoder_input_ids,
-                                        encoder_hidden_states=encoder_output,
-                                        kv_cache=kv_caches,
-                                        input_metadata=input_metadata)
+                                          encoder_hidden_states=encoder_output,
+                                          kv_cache=kv_caches,
+                                          input_metadata=input_metadata)
         return decoder_output
 
     def sample(self, hidden_states: torch.Tensor,
@@ -395,11 +406,30 @@ class WhisperForConditionalGeneration(nn.Module):
         load_format: str = "auto",
         revision: Optional[str] = None,
     ):
+        column_parallel_weight_names = [
+            "k_proj.weight", "v_proj.weight", "q_proj.weight", "q_proj.bias",
+            "v_proj.bias", "fc1.bias", "fc1.weight"
+        ]
+        row_parallel_weight_names = ["out_proj.weight", "fc2.weight"]
+
+        parallel_weight_names = column_parallel_weight_names + row_parallel_weight_names
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
-        for name, loaded_weight in hf_model_weights_iterator(model_name_or_path, cache_dir, load_format, revision):
+        for name, loaded_weight in hf_model_weights_iterator(
+                model_name_or_path, cache_dir, load_format, revision):
             name = name.replace("model.", "")
             assert name in params_dict, f"{name} not in params_dict"
             param = params_dict[name]
+            if any(_name in name for _name in parallel_weight_names):
+                load_tensor_parallel_weights(
+                    param,
+                    loaded_weight,
+                    name,
+                    column_parallel_weight_names=column_parallel_weight_names,
+                    row_parallel_weight_names=row_parallel_weight_names,
+                    tensor_model_parallel_rank=get_tensor_model_parallel_rank(
+                    ))
+                continue
             assert param.shape == loaded_weight.shape, (
                 f"{name} shape mismatch between model and checkpoint: "
                 f"{param.shape} != {loaded_weight.shape}")

@@ -4,8 +4,10 @@ from datasets import load_dataset
 from vllm.config import AudioFeaturesConfig
 
 import os
+
 os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 os.environ['CUDA_VISIBLE_DEVICES'] = "3,4,5,6"
+
 
 @pytest.fixture()
 def model_id():
@@ -44,9 +46,9 @@ def test_text_to_audio_scenario(hf_runner, vllm_runner, model_id, prompts,
 
     vllm_model = vllm_runner(model_id,
                              dtype=dtype,
-                             worker_use_ray=False,
+                             worker_use_ray=True,
                              enforce_eager=True,
-                             tensor_parallel_size = 3,
+                             tensor_parallel_size=3,
                              gpu_memory_utilization=0.9)
     vllm_outputs = vllm_model.generate_greedy(prompts,
                                               max_tokens,
