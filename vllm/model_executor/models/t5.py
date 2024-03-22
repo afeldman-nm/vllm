@@ -25,6 +25,7 @@ import torch
 from torch import nn
 from transformers import T5Config
 
+from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.enc_dec_attention import (
@@ -39,12 +40,11 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size, )
+    get_tensor_model_parallel_world_size, get_tensor_model_parallel_rank)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.model_executor.weight_utils import (
-    default_weight_loader,
-    hf_model_weights_iterator,
-)
+from vllm.model_executor.weight_utils import (default_weight_loader,
+                                              hf_model_weights_iterator,
+                                              load_tensor_parallel_weights)
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 
@@ -152,16 +152,19 @@ class T5Attention(nn.Module):
         )
         assert total_num_heads % tensor_model_parallel_world_size == 0
         self.n_heads = total_num_heads // tensor_model_parallel_world_size
-        self.inner_dim = self.n_heads * self.key_value_proj_dim
 
-        self.q = ColumnParallelLinear(self.d_model, self.inner_dim, bias=False)
-        self.k = ColumnParallelLinear(self.d_model, self.inner_dim, bias=False)
-        self.v = ColumnParallelLinear(self.d_model, self.inner_dim, bias=False)
-        self.o = RowParallelLinear(self.inner_dim, self.d_model, bias=False)
+        self.q = ColumnParallelLinear(self.d_model, self.d_model, bias=False)
+        self.k = ColumnParallelLinear(self.d_model, self.d_model, bias=False)
+        self.v = ColumnParallelLinear(self.d_model, self.d_model, bias=False)
+        self.o = RowParallelLinear(self.d_model, self.d_model, bias=False)
 
         if has_relative_attention_bias:
-            self.relative_attention_bias = nn.Embedding(
-                self.relative_attention_num_buckets, self.n_heads)
+            if tensor_model_parallel_world_size > 1:
+                self.relative_attention_bias = VocabParallelEmbedding(
+                    self.relative_attention_num_buckets, total_num_heads)
+            else:
+                self.relative_attention_bias = nn.Embedding(
+                    self.relative_attention_num_buckets, total_num_heads)
 
         self.is_cross = is_cross
         if self.is_decoder:
@@ -519,7 +522,7 @@ class T5ForConditionalGeneration(nn.Module):
         self.config = config
         self.model_dim = config.d_model
 
-        self.shared = nn.Embedding(config.vocab_size, config.d_model)
+        self.shared = VocabParallelEmbedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
         encoder_config.is_decoder = False
@@ -575,6 +578,14 @@ class T5ForConditionalGeneration(nn.Module):
         load_format: str = "auto",
         revision: Optional[str] = None,
     ):
+        column_parallel_weight_names = [
+            "k.weight", "v.weight", "q.weight", "wi_0.weight", "wi.weight",
+            "shared.weight"
+        ]
+        row_parallel_weight_names = ["o.weight"]
+
+        parallel_weight_names = column_parallel_weight_names + row_parallel_weight_names
+
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in hf_model_weights_iterator(
                 model_name_or_path, cache_dir, load_format, revision):
@@ -583,9 +594,23 @@ class T5ForConditionalGeneration(nn.Module):
 
             assert name in params_dict, f"{name} not in params_dict"
             param = params_dict[name]
-            assert param.shape == loaded_weight.shape, (
-                f"{name} shape mismatch between model and checkpoint: "
-                f"{param.shape} != {loaded_weight.shape}")
+            if any(_name in name for _name in parallel_weight_names):
+                load_tensor_parallel_weights(
+                    param,
+                    loaded_weight,
+                    name,
+                    column_parallel_weight_names=[
+                        "k.weight", "v.weight", "q.weight", "wi_0.weight",
+                        "wi.weight", "shared.weight"
+                    ],
+                    row_parallel_weight_names=["o.weight"],
+                    tensor_model_parallel_rank=get_tensor_model_parallel_rank(
+                    ))
+                continue
+
+            if param.shape != loaded_weight.shape:
+                print(f"{name} shape mismatch between model and checkpoint: "
+                      f"{param.shape} != {loaded_weight.shape}")
             weight_loader = getattr(param, "weight_loader",
                                     default_weight_loader)
             weight_loader(param, loaded_weight)

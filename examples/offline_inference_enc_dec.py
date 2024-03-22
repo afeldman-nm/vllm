@@ -8,10 +8,13 @@ Scenarios:
 
 Output: for several prompts, compare native PyTorch & vLLM prompt completions
 '''
+import os
 import warnings
 import torch
 from vllm import LLM, SamplingParams
 from transformers import T5Tokenizer, T5ForConditionalGeneration
+
+os.environ["CUDA_VISIBLE_DEVICES"] = "0, 1, 2, 3"
 
 warnings.filterwarnings("ignore",
                         category=UserWarning,
@@ -51,10 +54,16 @@ if torch.cuda.is_available():
 native_outputs = model.generate(input_ids).cpu()
 
 # vLLM test
-model = LLM(hf_model_id,
-            enforce_eager=True,
-            dtype=dtype,
-            gpu_memory_utilization=0.5)
+model = LLM(
+    hf_model_id,
+    enforce_eager=True,
+    dtype=dtype,
+    gpu_memory_utilization=0.5,
+    # tensor_parallel_size=
+    # 1 -> correctness
+    # 2 -> first tokens are correct, but the rest are not
+    # 4 -> weird behavior on relative_attention_bias sharding
+    tensor_parallel_size=2)
 
 sampling_params = SamplingParams(max_tokens=100, temperature=0)
 
