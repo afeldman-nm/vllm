@@ -84,11 +84,25 @@ class T5DenseActDense(nn.Module):
         self.wi = ColumnParallelLinear(config.d_model, config.d_ff, bias=False)
         self.wo = RowParallelLinear(config.d_ff, config.d_model, bias=False)
         self.act = get_act_fn(config.dense_act_fn)
+        # for debugging
+        self.expected_d_ff = config.d_ff // get_tensor_model_parallel_world_size(
+        )
+        self.d_model = config.d_model
 
     def forward(self, hidden_states):
+        # hidden_states comes in unsharded
+        # hidden_states.shape -> (bsz, seq_len, d_model)
+        assert hidden_states.shape[-1] == self.d_model
+
+        #### This sequence of operations is sharded ####
         hidden_states, _ = self.wi(hidden_states)
+        assert hidden_states.shape[-1] == self.expected_d_ff
         hidden_states = self.act(hidden_states)
+        assert hidden_states.shape[-1] == self.expected_d_ff
         hidden_states, _ = self.wo(hidden_states)
+        ###############################################
+        assert hidden_states.shape[-1] == self.d_model  # unsharded
+
         return hidden_states
 
 
@@ -159,12 +173,13 @@ class T5Attention(nn.Module):
         self.o = RowParallelLinear(self.d_model, self.d_model, bias=False)
 
         if has_relative_attention_bias:
-            if tensor_model_parallel_world_size > 1:
-                self.relative_attention_bias = VocabParallelEmbedding(
-                    self.relative_attention_num_buckets, total_num_heads)
-            else:
-                self.relative_attention_bias = nn.Embedding(
-                    self.relative_attention_num_buckets, total_num_heads)
+            # sharded attn_bias
+            # note: attn_bias is probably not a linear function of
+            # the input and needs more than just a context of the
+            # sharded part of the input. Also, padding of the vocabulary
+            # messes up the sharding logic
+            self.relative_attention_bias = nn.Embedding(
+                self.relative_attention_num_buckets, self.n_heads)
 
         self.is_cross = is_cross
         if self.is_decoder:
@@ -261,7 +276,13 @@ class T5Attention(nn.Module):
         input_metadata: InputMetadata,
         encoder_hidden_states: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        # unshared hidden_states
+        assert hidden_states.shape[-1] == self.d_model
         q, _ = self.q(hidden_states)
+
+        # sharded query i.e
+        # q.shape -> (bsz, seq_len, n_heads_per_shard * kv_dim)
+        assert q.shape[-1] == self.key_value_proj_dim * self.n_heads
 
         batch_size = hidden_states.shape[0]
         seq_len = hidden_states.shape[1]
@@ -276,6 +297,10 @@ class T5Attention(nn.Module):
             # Encoder self attention, no cache operations
             k, _ = self.k(hidden_states)
             v, _ = self.v(hidden_states)
+            # sharded k,v
+            # k.shape, v.shape -> (bsz, seq_len, n_heads_per_shard * kv_dim)
+            assert k.shape[-1] == self.key_value_proj_dim * self.n_heads
+            assert v.shape[-1] == self.key_value_proj_dim * self.n_heads
 
             if input_metadata.attn_bias is None:
                 input_metadata.attn_bias = self.compute_bias(
@@ -293,6 +318,10 @@ class T5Attention(nn.Module):
             # Decoder self attention
             k, _ = self.k(hidden_states)
             v, _ = self.v(hidden_states)
+            # sharded k,v
+            # k.shape, v.shape -> (bsz, seq_len, n_heads_per_shard * kv_dim)
+            assert k.shape[-1] == self.key_value_proj_dim * self.n_heads
+            assert v.shape[-1] == self.key_value_proj_dim * self.n_heads
 
             if input_metadata.attn_bias is None:
                 position_bias = self.compute_bias(
@@ -321,8 +350,15 @@ class T5Attention(nn.Module):
             else:
                 attn_output = self.attn(q, None, None, key_cache, value_cache,
                                         input_metadata)
+        # attn output should remain sharded
+        # attn_output.shape -> (bsz, seq_len, n_heads_per_shard * kv_dim)
+        assert attn_output.shape[-1] == self.key_value_proj_dim * self.n_heads
 
         attn_output, _ = self.o(attn_output)
+
+        # the self.o layer introduces all_reduce
+        # attn_output.shape -> (bsz, seq_len, d_model)
+        assert attn_output.shape[-1] == self.d_model
         return attn_output
 
 
@@ -522,6 +558,8 @@ class T5ForConditionalGeneration(nn.Module):
         self.config = config
         self.model_dim = config.d_model
 
+        # the embeddings can be safely shared between models
+        # nn.Embedding -> VocabParallelEmbedding
         self.shared = VocabParallelEmbedding(config.vocab_size, config.d_model)
 
         encoder_config = copy.deepcopy(config)
@@ -578,11 +616,22 @@ class T5ForConditionalGeneration(nn.Module):
         load_format: str = "auto",
         revision: Optional[str] = None,
     ):
+
+        # some weights are sharded across tensor model parallel dimensions
+        # we need to load them in a special way
         column_parallel_weight_names = [
-            "k.weight", "v.weight", "q.weight", "wi_0.weight", "wi.weight",
-            "shared.weight"
+            "k.weight",
+            "v.weight",
+            "q.weight",
+            "wi_0.weight",
+            "wi.weight",
+            "shared.weight",
         ]
-        row_parallel_weight_names = ["o.weight"]
+        row_parallel_weight_names = [
+            "o.weight",
+            "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight",
+            "encoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight"
+        ]
 
         parallel_weight_names = column_parallel_weight_names + row_parallel_weight_names
 
@@ -592,6 +641,9 @@ class T5ForConditionalGeneration(nn.Module):
             if "EncDecAttention.relative_attention_bias" in name:
                 continue
 
+            if name == "decoder.block.0.layer.0.SelfAttention.relative_attention_bias.weight":
+                pass
+
             assert name in params_dict, f"{name} not in params_dict"
             param = params_dict[name]
             if any(_name in name for _name in parallel_weight_names):
@@ -599,11 +651,8 @@ class T5ForConditionalGeneration(nn.Module):
                     param,
                     loaded_weight,
                     name,
-                    column_parallel_weight_names=[
-                        "k.weight", "v.weight", "q.weight", "wi_0.weight",
-                        "wi.weight", "shared.weight"
-                    ],
-                    row_parallel_weight_names=["o.weight"],
+                    column_parallel_weight_names=column_parallel_weight_names,
+                    row_parallel_weight_names=row_parallel_weight_names,
                     tensor_model_parallel_rank=get_tensor_model_parallel_rank(
                     ))
                 continue
