@@ -57,7 +57,7 @@ if torch.cuda.is_available():
 native_outputs = model.generate(input_ids).cpu()
 
 # vLLM test
-for num_model_shards in [1, 2, 3]:
+for num_model_shards in [1, 4]:
     model = LLM(hf_model_id,
                 enforce_eager=True,
                 dtype=dtype,
