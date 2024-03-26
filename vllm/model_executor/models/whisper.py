@@ -95,12 +95,8 @@ class WhisperAttention(nn.Module):
         bsz, seq_len, _ = hidden_states.size()
         q, _ = self.q_proj(hidden_states)
         q = q * self.scaling  # could be potentially done elsewhere
-        if kv_cache is not None:
-            if self.is_decoder and kv_cache[0] is None:
-                return hidden_states
 
         if self.is_decoder and self.is_cross:
-            print("Cross attention")
             if encoder_hidden_states is None:
                 raise ValueError(
                     "Decoder cross-attention step. The encoder_hidden_states must be specified"
@@ -120,7 +116,6 @@ class WhisperAttention(nn.Module):
                                     input_metadata)
 
         elif self.is_decoder and not self.is_cross:
-            print("Self Attention")
             key_cache, value_cache = kv_cache
             k, _ = self.k_proj(hidden_states)
             v, _ = self.v_proj(hidden_states)
@@ -139,7 +134,6 @@ class WhisperAttention(nn.Module):
                                     input_metadata)
 
         else:
-            print("Encoder Attention")
             # Encoding step. This means that the transformer blocks
             # only employ self-attention and there is no KV cache
             # available to be used
@@ -388,11 +382,13 @@ class WhisperForConditionalGeneration(nn.Module):
                 input_features.device) * self.config.decoder_start_token_id
         else:
             decoder_input_ids = input_ids
-        input_features = input_features.to(dtype=torch.float32)
 
         encoder_output = self.encoder(input_features,
                                       input_metadata=input_metadata)
-        decoder_output = self.decoder(input_ids=decoder_input_ids,
+        if kv_caches[0][0] is None:
+            decoder_output = None
+        else:
+            decoder_output = self.decoder(input_ids=decoder_input_ids,
                                           encoder_hidden_states=encoder_output,
                                           kv_cache=kv_caches,
                                           input_metadata=input_metadata)
