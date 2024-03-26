@@ -7,10 +7,10 @@ import torch.nn as nn
 from xformers import ops as xops
 from xformers.ops.fmha.attn_bias import (
     BlockDiagonalCausalMask, )
-from vllm._C import cache_ops
 from vllm.model_executor.input_metadata import InputMetadata
 from vllm.utils import is_hip
-from vllm.model_executor.layers.attention import paged_attention
+from vllm.model_executor.layers.attention.ops.paged_attn import (
+    PagedAttentionImpl)
 
 _SUPPORTED_HEAD_SIZES = [64, 80, 96, 112, 128, 256]
 
@@ -56,7 +56,8 @@ class EncoderAttention(EncDecAttention):
             query: Query tensor.
             key: Key tensor.
             value: Value tensor.
-            custom_bias: Custom bias tensor.
+            custom_bias: Custom bias tensor. Set to None if not used
+                (i.e. we are not masking the tokens in any way)
 
         Returns:
             Output tensor.
@@ -67,17 +68,11 @@ class EncoderAttention(EncDecAttention):
         # custom_bias: [batch_size, seq_len, seq_len]
         # output: [batch_size, seq_len, num_heads * head_size]
 
-        assert input_metadata.is_prompt
         batch_size, seq_len, hidden_size = query.shape
         # Reshape the query, key, and value tensors.
         query = query.view(batch_size, seq_len, self.num_heads, self.head_size)
         key = key.view(batch_size, seq_len, self.num_heads, self.head_size)
         value = value.view(batch_size, seq_len, self.num_heads, self.head_size)
-        if input_metadata.attn_bias is None:
-            input_metadata.attn_bias = BlockDiagonalCausalMask.from_seqlens(
-                [seq_len] * batch_size)
-
-        input_metadata.attn_bias = input_metadata.attn_bias[:, :, :, :seq_len]
 
         # Normal attention
         out = xops.memory_efficient_attention_forward(
@@ -138,30 +133,29 @@ class DecoderAttention(EncDecAttention):
         # profiling run.
         if key_cache is not None and value_cache is not None:
 
-            cache_ops.reshape_and_cache(
-                key, value, key_cache, value_cache,
-                input_metadata.slot_mapping[:, -1].flatten().contiguous(),
-                input_metadata.kv_cache_dtype)
+            PagedAttentionImpl.reshape_and_cache(key, value, key_cache,
+                                                 value_cache, input_metadata)
 
         max_prompt_len = input_metadata.prompt_lens.max().item()
         block_size = value_cache.shape[3]
         prompt_table_len = (max_prompt_len + block_size - 1) // block_size
-        block_tables = input_metadata.block_tables[:,
-                                                   prompt_table_len:].contiguous(
-                                                   )
-        output = paged_attention(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_tables=block_tables,
-            context_lens=input_metadata.context_lens,
-            max_context_len=input_metadata.max_context_len,
-            num_kv_heads=self.num_heads,
-            scale=self.scale,
-            alibi_slopes=None,
-            custom_bias=input_metadata.attn_bias.to(torch.float32),
-            kv_cache_dtype=input_metadata.kv_cache_dtype,
-        )
+        self_attn_block_tables = input_metadata.block_tables[:,
+                                                             prompt_table_len:].contiguous(
+                                                             )
+
+        output = PagedAttentionImpl.forward_decode(
+            query,
+            key_cache,
+            value_cache,
+            input_metadata,
+            self.num_heads,
+            self.scale,
+            None,  # No alibi slopes
+            apply_attn_bias=
+            True,  # Relative positional encoding (utilized i.e. by T5),
+            override_context_lens=input_metadata.context_lens,
+            override_max_context_len=input_metadata.max_context_len,
+            override_block_tables=self_attn_block_tables)
         return output.view(batch_size, seq_len, hidden_size)
 
 
@@ -209,34 +203,28 @@ class CrossAttention(EncDecAttention):
         if (input_metadata.is_prompt and key_cache is not None
                 and value_cache is not None):
             assert key is not None and value is not None
-            cache_ops.reshape_and_cache(
-                key,
-                value,
-                key_cache,
-                value_cache,
-                input_metadata.slot_mapping[:, :-1].flatten().contiguous(),
-                input_metadata.kv_cache_dtype,
-            )
+            PagedAttentionImpl.reshape_and_cache(key, value, key_cache,
+                                                 value_cache, input_metadata)
 
         max_prompt_len = input_metadata.prompt_lens.int().max().item()
         block_size = value_cache.shape[3]
         prompt_table_len = (max_prompt_len + block_size - 1) // block_size
-        block_tables = input_metadata.block_tables[:, :
-                                                   prompt_table_len].contiguous(
-                                                   )
+        cross_attn_block_tables = input_metadata.block_tables[:, :
+                                                              prompt_table_len].contiguous(
+                                                              )
 
-        output = paged_attention(
-            query=query,
-            key_cache=key_cache,
-            value_cache=value_cache,
-            block_tables=block_tables,
-            context_lens=input_metadata.prompt_lens.int(),
-            max_context_len=max_prompt_len,
-            num_kv_heads=self.num_heads,
-            scale=self.scale,
-            alibi_slopes=None,
-            custom_bias=None,
-            kv_cache_dtype=input_metadata.kv_cache_dtype,
-        )
+        # Cross-attention decode run.
+        output = PagedAttentionImpl.forward_decode(
+            query,
+            key_cache,
+            value_cache,
+            input_metadata,
+            self.num_heads,
+            self.scale,
+            None,  # No alibi slopes
+            apply_attn_bias=False,
+            override_context_lens=input_metadata.prompt_lens.int(),
+            override_max_context_len=max_prompt_len,
+            override_block_tables=cross_attn_block_tables)
 
         return output.view(batch_size, seq_len, hidden_size)

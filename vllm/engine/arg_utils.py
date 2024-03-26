@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
-                         ParallelConfig, SchedulerConfig, LoRAConfig)
+                         ParallelConfig, SchedulerConfig, LoRAConfig,
+                         AudioFeaturesConfig)
 
 
 @dataclass
@@ -25,11 +26,13 @@ class EngineArgs:
     tensor_parallel_size: int = 1
     max_parallel_loading_workers: Optional[int] = None
     block_size: int = 16
+    enable_prefix_caching: bool = False
     swap_space: int = 4  # GiB
     gpu_memory_utilization: float = 0.90
     max_num_batched_tokens: Optional[int] = None
     max_num_seqs: int = 256
     max_paddings: int = 256
+    max_logprobs: int = 5  # OpenAI default value
     disable_log_stats: bool = False
     revision: Optional[str] = None
     code_revision: Optional[str] = None
@@ -45,6 +48,7 @@ class EngineArgs:
     lora_dtype = 'auto'
     max_cpu_loras: Optional[int] = None
     device: str = 'auto'
+    ray_workers_use_nsight: bool = False
 
     def __post_init__(self):
         if self.tokenizer is None:
@@ -57,7 +61,7 @@ class EngineArgs:
 
         # NOTE: If you update any of the arguments below, please also
         # make sure to update docs/source/models/engine_args.rst
-
+        # TODO: Add Whisper-specific arguments maybe
         # Model arguments
         parser.add_argument(
             '--model',
@@ -167,12 +171,21 @@ class EngineArgs:
             help='load model sequentially in multiple batches, '
             'to avoid RAM OOM when using tensor '
             'parallel and large models')
+        parser.add_argument(
+            '--ray-workers-use-nsight',
+            action='store_true',
+            help='If specified, use nsight to profile ray workers')
         # KV cache arguments
         parser.add_argument('--block-size',
                             type=int,
                             default=EngineArgs.block_size,
                             choices=[8, 16, 32, 128],
                             help='token block size')
+
+        parser.add_argument('--enable-prefix-caching',
+                            action='store_true',
+                            help='Enables automatic prefix caching')
+
         parser.add_argument('--seed',
                             type=int,
                             default=EngineArgs.seed,
@@ -201,6 +214,12 @@ class EngineArgs:
                             type=int,
                             default=EngineArgs.max_paddings,
                             help='maximum number of paddings in a batch')
+        parser.add_argument(
+            '--max-logprobs',
+            type=int,
+            default=EngineArgs.max_logprobs,
+            help=('max number of log probs to return logprobs is specified in'
+                  ' SamplingParams'))
         parser.add_argument('--disable-log-stats',
                             action='store_true',
                             help='disable logging statistics')
@@ -282,23 +301,27 @@ class EngineArgs:
     def create_engine_configs(
         self,
     ) -> Tuple[ModelConfig, CacheConfig, ParallelConfig, SchedulerConfig,
-               DeviceConfig, Optional[LoRAConfig]]:
+               DeviceConfig, Optional[LoRAConfig],
+               Optional[AudioFeaturesConfig]]:
         device_config = DeviceConfig(self.device)
         model_config = ModelConfig(
             self.model, self.tokenizer, self.tokenizer_mode,
             self.trust_remote_code, self.download_dir, self.load_format,
             self.dtype, self.seed, self.revision, self.code_revision,
             self.tokenizer_revision, self.max_model_len, self.quantization,
-            self.enforce_eager, self.max_context_len_to_capture)
+            self.enforce_eager, self.max_context_len_to_capture,
+            self.max_logprobs)
         cache_config = CacheConfig(self.block_size,
                                    self.gpu_memory_utilization,
                                    self.swap_space, self.kv_cache_dtype,
-                                   model_config.get_sliding_window())
+                                   model_config.get_sliding_window(),
+                                   self.enable_prefix_caching)
         parallel_config = ParallelConfig(self.pipeline_parallel_size,
                                          self.tensor_parallel_size,
                                          self.worker_use_ray,
                                          self.max_parallel_loading_workers,
-                                         self.disable_custom_all_reduce)
+                                         self.disable_custom_all_reduce,
+                                         self.ray_workers_use_nsight)
         scheduler_config = SchedulerConfig(self.max_num_batched_tokens,
                                            self.max_num_seqs,
                                            model_config.max_model_len,
@@ -310,8 +333,10 @@ class EngineArgs:
             lora_dtype=self.lora_dtype,
             max_cpu_loras=self.max_cpu_loras if self.max_cpu_loras
             and self.max_cpu_loras > 0 else None) if self.enable_lora else None
+        audio_features_config = AudioFeaturesConfig(
+        )  #TODO: For now is default
         return (model_config, cache_config, parallel_config, scheduler_config,
-                device_config, lora_config)
+                device_config, lora_config, audio_features_config)
 
 
 @dataclass

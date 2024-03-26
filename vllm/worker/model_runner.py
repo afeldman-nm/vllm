@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from vllm.config import (DeviceConfig, ModelConfig, LoRAConfig, ParallelConfig,
-                         SchedulerConfig)
+                         SchedulerConfig, AudioFeaturesConfig)
 from vllm.logger import init_logger
 from vllm.model_executor import get_model, InputMetadata, SamplingMetadata
 from vllm.model_executor.parallel_utils import cupy_utils
@@ -17,11 +17,11 @@ from vllm.model_executor.parallel_utils.parallel_state import (
     with_cupy_nccl_for_all_reduce)
 from vllm.model_executor.parallel_utils import custom_all_reduce
 from vllm.sampling_params import SamplingParams, SamplingType
-from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata
+from vllm.sequence import SamplerOutput, SequenceData, SequenceGroupMetadata, MultiModalData
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
-from vllm.utils import in_wsl
+from vllm.utils import in_wsl, measure_cuda_memory
 
 logger = init_logger(__name__)
 
@@ -42,6 +42,7 @@ class ModelRunner:
         scheduler_config: SchedulerConfig,
         device_config: DeviceConfig,
         lora_config: Optional[LoRAConfig],
+        audio_features_config: Optional[AudioFeaturesConfig],
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
     ):
@@ -49,6 +50,7 @@ class ModelRunner:
         self.parallel_config = parallel_config
         self.scheduler_config = scheduler_config
         self.lora_config = lora_config
+        self.audio_features_config = audio_features_config
         self.is_driver_worker = is_driver_worker
 
         # model_config can be None in tests/samplers/test_sampler.py.
@@ -85,25 +87,33 @@ class ModelRunner:
             self.model_config.enforce_eager = True
 
         # Unpack HF is_encoder_decoder config attribute
-        # NOTE: must handle "self.model_config is None" case imposed by certain tests i.e. test_prepare_prompt()
-        # In the None case, default to is_encoder_decoder == False since vLLM decoder-only mode is known to handle
+        # NOTE: must handle "self.model_config is None" case imposed by
+        # certain tests i.e. test_prepare_prompt()
+        # In the None case, default to is_encoder_decoder == False
+        # since vLLM decoder-only mode is known to handle
         # the None case correctly.
         self.is_encoder_decoder = False if self.model_config is None else \
-                                        getattr(self.model_config.hf_config, "is_encoder_decoder", False)
+                                        getattr(self.model_config.hf_config, \
+                                                "is_encoder_decoder", False)
 
     def load_model(self) -> None:
-        self.model = get_model(self.model_config,
-                               self.device_config,
-                               lora_config=self.lora_config,
-                               parallel_config=self.parallel_config,
-                               scheduler_config=self.scheduler_config)
+        with measure_cuda_memory() as m:
+            self.model = get_model(
+                self.model_config,
+                self.device_config,
+                lora_config=self.lora_config,
+                audio_features_config=self.audio_features_config,
+                parallel_config=self.parallel_config,
+                scheduler_config=self.scheduler_config)
 
-        vocab_size = self.model.config.vocab_size
+        self.model_memory_usage = m.consumed_memory
+        logger.info(f"Loading model weights took "
+                    f"{self.model_memory_usage / float(2**30):.4f} GB")
 
         if self.lora_config:
-            assert hasattr(
-                self.model, "supported_lora_modules"
-            ) and self.model.supported_lora_modules, "Model does not support LoRA"
+            assert hasattr(self.model, "supported_lora_modules"
+                           ) and self.model.supported_lora_modules, (
+                               "Model does not support LoRA")
             assert hasattr(
                 self.model,
                 "embedding_modules"), "Model does not have embedding_modules"
@@ -112,7 +122,7 @@ class ModelRunner:
             self.lora_manager = LRUCacheWorkerLoRAManager(
                 self.scheduler_config.max_num_seqs,
                 self.scheduler_config.max_num_batched_tokens +
-                self.scheduler_config.max_paddings, vocab_size,
+                self.scheduler_config.max_paddings, self.vocab_size,
                 self.lora_config, self.device, self.model.embedding_modules,
                 self.model.embedding_padding_modules)
             self.model = self.lora_manager.create_lora_manager(self.model)
@@ -129,10 +139,11 @@ class ModelRunner:
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, List[int], List[int],
-               List[int], List[int], Set[LoRARequest]]:
+               List[int], List[int], Set[LoRARequest], "torch.Tensor"]:
         assert len(seq_group_metadata_list) > 0
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
+        multi_modal_inputs: List = []
         slot_mapping: List[List[int]] = []
         lora_index_mapping: List[int] = []
         lora_prompt_mapping: List[int] = []
@@ -155,37 +166,50 @@ class ModelRunner:
             prompt_len = len(prompt_tokens)
             prompt_lens.append(prompt_len)
 
-            prefix_len = 0
+            computed_len = 0
+            computed_block_nums = seq_group_metadata.computed_block_nums
             if self.is_encoder_decoder:
+                # Encoder/decoder mode does not support prefix cache
+                assert computed_block_nums is None or \
+                       len(computed_block_nums) == 0, \
+                       "Encoder decoder models do not support Prefix Cache yet"
+                # Context length == 1 due to decoder_start token
                 context_lens.append(1)
             else:
-                prefix = seq_group_metadata.prefix
-                if prefix is not None and prefix.computed:
-                    prefix_len = prefix.get_length()
-                    prompt_tokens = prompt_tokens[prefix_len:]
-                    prefix_block_tables.append(prefix.get_block_numbers())
+                # NOTE: This only works for oooooooxxx style attention.
+                if computed_block_nums is not None and len(
+                        computed_block_nums
+                ) > 0 and self.sliding_window is None:
+                    # Prefix is not supported with sliding_window
+                    computed_len = len(computed_block_nums) * self.block_size
+                    prompt_tokens = prompt_tokens[computed_len:]
+                    prefix_block_tables.append(computed_block_nums)
                 else:
                     prefix_block_tables.append([])
                 # actual prompt lens
-                context_lens.append(prefix_len)
-            subquery_lens.append(prompt_len - prefix_len)
+                context_lens.append(computed_len)
+            subquery_lens.append(prompt_len - computed_len)
 
             input_tokens.append(prompt_tokens)
             # NOTE(woosuk): Here we assume that the first token in the prompt
             # is always the first token in the sequence.
             input_positions.append(
-                list(range(prefix_len, prefix_len + len(prompt_tokens))))
+                list(range(computed_len, computed_len + len(prompt_tokens))))
 
             lora_id = seq_group_metadata.lora_int_id
 
             if lora_id > 0:
                 lora_requests.add(seq_group_metadata.lora_request)
 
-            lora_index_mapping.append([lora_id] * (prompt_len - prefix_len))
+            lora_index_mapping.append([lora_id] * (prompt_len - computed_len))
             lora_prompt_mapping.extend(
                 [lora_id] *
-                (prompt_len - prefix_len
+                (prompt_len - computed_len
                  if seq_group_metadata.sampling_params.prompt_logprobs else 1))
+
+            if seq_group_metadata.multi_modal_data:
+                multi_modal_inputs.append(
+                    seq_group_metadata.multi_modal_data.data)
 
             if seq_group_metadata.block_tables is None:
                 # During memory profiling, the block tables are not initialized
@@ -203,11 +227,11 @@ class ModelRunner:
             # mapping will be [-1, -1, 2, 3, 4, 5, 6, 7, 0, 1].
             start_idx = 0
             if self.sliding_window is not None:
-                assert prefix_len == 0, (
+                assert computed_len == 0, (
                     "Prefix caching is currently not supported with "
                     "sliding window attention")
                 start_idx = max(0, prompt_len - self.sliding_window)
-            for i in range(prefix_len, prompt_len):
+            for i in range(computed_len, prompt_len):
                 if i < start_idx:
                     slot_mapping[-1].append(_PAD_SLOT_ID)
                     continue
@@ -222,6 +246,7 @@ class ModelRunner:
                 max_block_table_len = max(max_block_table_len,
                                           len(block_table))
         max_prompt_len = max(subquery_lens)
+        assert max_prompt_len > 0
         input_tokens = _make_tensor_with_pad(input_tokens,
                                              max_prompt_len,
                                              pad=0,
@@ -253,9 +278,16 @@ class ModelRunner:
         context_lens_tensor = torch.tensor(context_lens,
                                            dtype=torch.int,
                                            device=self.device)
+
+        if multi_modal_inputs:
+            multi_modal_input = torch.stack(multi_modal_inputs).to('cuda')
+        else:
+            multi_modal_input = None
+
         if self.is_encoder_decoder:
             padded_block_tables = []
-            # Pad the encoder block tables to the same length and then add a decoder block table in the end
+            # Pad the encoder block tables to the same length
+            # and then add a decoder block table in the end
             for block_table in block_tables:
                 block_table = block_table[:-1] + [0] * (
                     max_block_table_len - len(block_table)) + block_table[-1:]
@@ -300,7 +332,7 @@ class ModelRunner:
         )
         return (input_tokens, input_positions, input_metadata, prompt_lens,
                 subquery_lens, lora_index_mapping, lora_prompt_mapping,
-                lora_requests)
+                lora_requests, multi_modal_input)
 
     def _prepare_decode(
         self,
@@ -341,11 +373,13 @@ class ModelRunner:
                 prompt_lens.append(prompt_len)
 
                 if self.is_encoder_decoder:
-                    # Encoder-decoder model stores prompt and generation tokens separately,
+                    # Encoder-decoder model stores
+                    # prompt and generation tokens separately,
                     # so we need to adjust to the pad.
                     prompt_blocks_num = (prompt_len + self.block_size -
                                          1) // self.block_size
-                    prompt_pad = prompt_blocks_num * self.block_size - prompt_len
+                    prompt_pad = prompt_blocks_num * \
+                                 self.block_size - prompt_len
                     position += prompt_pad + 1  # One extra for decoder_start_id
 
                 if self.is_encoder_decoder:
@@ -373,7 +407,8 @@ class ModelRunner:
                 block_tables.append(block_table)
         if self.is_encoder_decoder:
             padded_block_tables = []
-            # Pad the encoder block tables to the same length and then add a decoder block table in the end
+            # Pad the encoder block tables to the same length
+            # and then add a decoder block table in the end
             for block_table in block_tables:
                 block_table = block_table[:-1] + [0] * (
                     max_block_table_len - len(block_table)) + block_table[-1:]
@@ -550,7 +585,7 @@ class ModelRunner:
         self,
         seq_group_metadata_list: Optional[List[SequenceGroupMetadata]],
     ) -> Tuple[torch.Tensor, torch.Tensor, InputMetadata, SamplingMetadata,
-               Set[int], LoRAMapping]:
+               Set[int], LoRAMapping, "torch.Tensor"]:
         if self.is_driver_worker:
             # NOTE: We assume that all sequences in the group are all prompts or
             # all decodes.
@@ -559,13 +594,15 @@ class ModelRunner:
             if is_prompt:
                 (input_tokens, input_positions, input_metadata, prompt_lens,
                  subquery_lens, lora_index_mapping, lora_prompt_mapping,
-                 lora_requests) = self._prepare_prompt(seq_group_metadata_list)
+                 lora_requests, multi_modal_input
+                 ) = self._prepare_prompt(seq_group_metadata_list)
             else:
                 (input_tokens, input_positions, input_metadata,
                  lora_index_mapping, lora_prompt_mapping,
                  lora_requests) = self._prepare_decode(seq_group_metadata_list)
                 prompt_lens = []
                 subquery_lens = None
+                multi_modal_input = None
             sampling_metadata = self._prepare_sample(seq_group_metadata_list,
                                                      prompt_lens,
                                                      subquery_lens)
@@ -599,6 +636,7 @@ class ModelRunner:
                 sampling_metadata.selected_token_indices,
                 "lora_requests": lora_requests,
                 "lora_mapping": lora_mapping,
+                "multi_modal_input": multi_modal_input,
             }
             broadcast_tensor_dict(metadata_dict, src=0)
         else:
@@ -607,6 +645,7 @@ class ModelRunner:
             input_positions = metadata_dict["input_positions"]
             lora_mapping = metadata_dict["lora_mapping"]
             lora_requests = metadata_dict["lora_requests"]
+            multi_modal_input = metadata_dict["multi_modal_input"]
             input_metadata = InputMetadata(
                 is_prompt=metadata_dict["is_prompt"],
                 slot_mapping=metadata_dict["slot_mapping"],
@@ -630,7 +669,8 @@ class ModelRunner:
             )
 
         return (input_tokens, input_positions, input_metadata,
-                sampling_metadata, lora_requests, lora_mapping)
+                sampling_metadata, lora_requests, lora_mapping,
+                multi_modal_input)
 
     @torch.inference_mode()
     def execute_model(
@@ -639,8 +679,8 @@ class ModelRunner:
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
     ) -> Optional[SamplerOutput]:
         (input_tokens, input_positions, input_metadata, sampling_metadata,
-         lora_requests,
-         lora_mapping) = self.prepare_input_tensors(seq_group_metadata_list)
+         lora_requests, lora_mapping, multi_modal_input
+         ) = self.prepare_input_tensors(seq_group_metadata_list)
 
         if self.lora_config:
             self.set_active_loras(lora_requests, lora_mapping)
@@ -651,12 +691,16 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
-        hidden_states = model_executable(
-            input_ids=input_tokens,
-            positions=input_positions,
-            kv_caches=kv_caches,
-            input_metadata=input_metadata,
-        )
+
+        execute_model_kwargs = {
+            "input_ids": input_tokens,
+            "positions": input_positions,
+            "kv_caches": kv_caches,
+            "input_metadata": input_metadata,
+        }
+        if self.audio_features_config:
+            execute_model_kwargs.update({"input_features": multi_modal_input})
+        hidden_states = model_executable(**execute_model_kwargs)
 
         # Sample the next token.
         output = self.model.sample(
@@ -668,8 +712,7 @@ class ModelRunner:
     @torch.inference_mode()
     def profile_run(self) -> None:
         # Enable top-k sampling to reflect the accurate memory usage.
-        vocab_size = self.model_config.get_vocab_size()
-        sampling_params = SamplingParams(top_p=0.99, top_k=vocab_size - 1)
+        sampling_params = SamplingParams(top_p=0.99, top_k=self.vocab_size - 1)
         max_num_batched_tokens = self.scheduler_config.max_num_batched_tokens
         max_num_seqs = self.scheduler_config.max_num_seqs
 
@@ -698,10 +741,12 @@ class ModelRunner:
         # Profile memory usage with max_num_sequences sequences and the total
         # number of tokens equal to max_num_batched_tokens.
         seqs: List[SequenceGroupMetadata] = []
+        # TODO: Look into the profiling of audio features
         for group_id in range(max_num_seqs):
             seq_len = (max_num_batched_tokens // max_num_seqs +
                        (group_id < max_num_batched_tokens % max_num_seqs))
-            seq_data = SequenceData([0] * seq_len)
+            seq_data, fake_multi_modal_input = _prepare_fake_inputs(
+                seq_len, self.audio_features_config)
             seq = SequenceGroupMetadata(
                 request_id=str(group_id),
                 is_prompt=True,
@@ -710,6 +755,7 @@ class ModelRunner:
                 block_tables=None,
                 lora_request=dummy_lora_requests_per_seq[group_id]
                 if dummy_lora_requests_per_seq else None,
+                multi_modal_data=fake_multi_modal_input,
             )
             seqs.append(seq)
 
@@ -773,6 +819,14 @@ class ModelRunner:
         slot_mapping.fill_(_PAD_SLOT_ID)
         context_lens = torch.ones(max_batch_size, dtype=torch.int32).cuda()
         block_tables = torch.from_numpy(self.graph_block_tables).cuda()
+        kwargs = {}
+        if self.audio_features_config:
+            fake_multi_modal_input = torch.zeros(
+                max_batch_size,
+                self.audio_features_config.feature_dims,
+                self.audio_features_config.sequence_length,
+                dtype=torch.float32).cuda()
+            kwargs["input_features"] = fake_multi_modal_input
 
         graph_batch_size = _get_graph_batch_size(
             self.scheduler_config.max_num_seqs)
@@ -818,6 +872,7 @@ class ModelRunner:
                     kv_caches,
                     input_metadata,
                     memory_pool=self.graph_memory_pool,
+                    **kwargs,
                 )
                 self.graph_memory_pool = graph_runner.graph.pool()
                 self.graph_runners[batch_size] = graph_runner
@@ -835,6 +890,10 @@ class ModelRunner:
         self.graph_runners.clear()
         self.cupy_nccl_backend = None
 
+    @property
+    def vocab_size(self) -> int:
+        return self.model_config.get_vocab_size()
+
 
 class CUDAGraphRunner:
 
@@ -851,6 +910,7 @@ class CUDAGraphRunner:
         kv_caches: List[KVCache],
         input_metadata: InputMetadata,
         memory_pool,
+        **kwargs,
     ) -> None:
         assert self.graph is None
         # Run the model once without capturing the graph.
@@ -858,10 +918,11 @@ class CUDAGraphRunner:
         # kernel launches for initial benchmarking (e.g., Triton autotune).
         with _maybe_cupy_nccl():
             self.model(
-                input_ids,
-                positions,
-                kv_caches,
-                input_metadata,
+                input_ids=input_ids,
+                positions=positions,
+                kv_caches=kv_caches,
+                input_metadata=input_metadata,
+                **kwargs,
             )
         torch.cuda.synchronize()
 
@@ -876,6 +937,7 @@ class CUDAGraphRunner:
                     positions,
                     kv_caches,
                     input_metadata,
+                    **kwargs,
                 )
         torch.cuda.synchronize()
 
@@ -897,6 +959,7 @@ class CUDAGraphRunner:
         positions: torch.Tensor,
         kv_caches: List[Tuple[torch.Tensor, torch.Tensor]],
         input_metadata: InputMetadata,
+        **kwargs,
     ) -> torch.Tensor:
         # KV caches are fixed tensors, so we don't need to copy them.
         del kv_caches
@@ -963,3 +1026,21 @@ def _async_h2d(
 ) -> torch.Tensor:
     t = torch.tensor(data, dtype=dtype, pin_memory=pin_memory, device="cpu")
     return t.to(device=target_device, non_blocking=True)
+
+
+def _prepare_fake_inputs(seq_len: int,
+                         audio_features_config: Optional[AudioFeaturesConfig]):
+    """Prepare fake inputs for profile run."""
+    if audio_features_config:
+        prompt_tokens = [0] * seq_len
+        fake_input_features = MultiModalData(
+            type=MultiModalData.Type.FEATURES,
+            data=torch.zeros(audio_features_config.feature_dims,
+                             audio_features_config.sequence_length,
+                             dtype=torch.float16))
+        fake_multi_modal_inputs = fake_input_features
+    else:
+
+        prompt_tokens = [0] * seq_len
+        fake_multi_modal_inputs = None
+    return SequenceData(prompt_tokens), fake_multi_modal_inputs

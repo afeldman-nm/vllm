@@ -7,7 +7,8 @@ import torch
 import torch.distributed
 
 from vllm.config import (CacheConfig, DeviceConfig, ModelConfig,
-                         ParallelConfig, SchedulerConfig, LoRAConfig)
+                         ParallelConfig, SchedulerConfig, LoRAConfig,
+                         AudioFeaturesConfig)
 from vllm.model_executor import set_random_seed
 from vllm.model_executor.parallel_utils import cupy_utils
 from vllm.model_executor.parallel_utils.communication_op import (
@@ -19,7 +20,6 @@ from vllm.sequence import SamplerOutput, SequenceGroupMetadata
 from vllm.worker.cache_engine import CacheEngine
 from vllm.worker.model_runner import ModelRunner
 from vllm.lora.request import LoRARequest
-from vllm.utils import is_hip
 
 
 class Worker:
@@ -40,6 +40,7 @@ class Worker:
         rank: int,
         distributed_init_method: str,
         lora_config: Optional[LoRAConfig] = None,
+        audio_features_config: Optional[AudioFeaturesConfig] = None,
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
     ) -> None:
@@ -55,13 +56,20 @@ class Worker:
         if self.is_driver_worker:
             assert self.rank == 0, "The driver worker must have rank 0."
 
-        self.model_runner = ModelRunner(model_config,
-                                        parallel_config,
-                                        scheduler_config,
-                                        device_config,
-                                        lora_config=self.lora_config,
-                                        kv_cache_dtype=kv_cache_dtype,
-                                        is_driver_worker=is_driver_worker)
+        self.audio_features_config = audio_features_config
+        if self.audio_features_config and self.lora_config:
+            raise NotImplementedError(
+                "Not yet tested: audio models with LoRA settings.")
+
+        self.model_runner = ModelRunner(
+            model_config,
+            parallel_config,
+            scheduler_config,
+            device_config,
+            lora_config=self.lora_config,
+            audio_features_config=self.audio_features_config,
+            kv_cache_dtype=kv_cache_dtype,
+            is_driver_worker=is_driver_worker)
         # Uninitialized cache engine. Will be initialized by
         # self.init_cache_engine().
         self.cache_config = None
@@ -131,8 +139,8 @@ class Worker:
         # GPU did not change their memory usage during the profiling.
         peak_memory = self.init_gpu_memory - free_gpu_memory
 
-        cache_block_size = CacheEngine.get_cache_block_size(
-            block_size, cache_dtype, self.model_config, self.parallel_config)
+        cache_block_size = self.get_cache_block_size_bytes(
+            block_size, cache_dtype)
         num_gpu_blocks = int(
             (total_gpu_memory * gpu_memory_utilization - peak_memory) //
             cache_block_size)
@@ -233,6 +241,22 @@ class Worker:
     def list_loras(self) -> Set[int]:
         return self.model_runner.list_loras()
 
+    @property
+    def max_model_len(self) -> int:
+        return self.model_config.max_model_len
+
+    @property
+    def vocab_size(self) -> int:
+        return self.model_runner.vocab_size
+
+    def get_cache_block_size_bytes(self, block_size: int,
+                                   cache_dtype: str) -> int:
+        """Get the size of the KV cache block size in bytes.
+        """
+        return CacheEngine.get_cache_block_size(block_size, cache_dtype,
+                                                self.model_config,
+                                                self.parallel_config)
+
 
 def init_distributed_environment(
     parallel_config: ParallelConfig,
@@ -267,8 +291,7 @@ def init_distributed_environment(
                 "cupy.distributed is already initialized but the cupy world "
                 "size does not match parallel_config.world_size "
                 f"({cupy_world_size} vs. {parallel_config.world_size}).")
-    elif (parallel_config.world_size > 1 and cupy_port is not None
-          and not is_hip()):
+    elif (parallel_config.world_size > 1 and cupy_port is not None):
         # NOTE(woosuk): We don't initialize CuPy process group when world size
         # is 1.
         # TODO(woosuk): Support multi-node connection.

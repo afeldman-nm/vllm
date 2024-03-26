@@ -20,6 +20,9 @@ from vllm.model_executor.layers.quantization import (get_quantization_config,
 
 logger = init_logger(__name__)
 
+_xdg_cache_home = os.getenv('XDG_CACHE_HOME', os.path.expanduser('~/.cache'))
+_vllm_filelocks_path = os.path.join(_xdg_cache_home, 'vllm/locks/')
+
 
 class Disabledtqdm(tqdm):
 
@@ -28,7 +31,8 @@ class Disabledtqdm(tqdm):
 
 
 def get_lock(model_name_or_path: str, cache_dir: Optional[str] = None):
-    lock_dir = cache_dir if cache_dir is not None else "/tmp"
+    lock_dir = cache_dir if cache_dir is not None else _vllm_filelocks_path
+    os.makedirs(os.path.dirname(lock_dir), exist_ok=True)
     lock_file_name = model_name_or_path.replace("/", "-") + ".lock"
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name))
     return lock
@@ -280,6 +284,34 @@ def default_weight_loader(param: torch.Tensor,
                           loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
     assert param.size() == loaded_weight.size()
+    param.data.copy_(loaded_weight)
+
+
+def load_tensor_parallel_weights(
+    param: torch.Tensor,
+    loaded_weight: torch.Tensor,
+    param_name: str,
+    column_parallel_weight_names: List[str],
+    row_parallel_weight_names: List[str],
+    tensor_model_parallel_rank: int,
+) -> None:
+    for p in column_parallel_weight_names:
+        if p in param_name:
+            shard_size = param.shape[0]
+            start_idx = tensor_model_parallel_rank * shard_size
+            end_idx = (tensor_model_parallel_rank + 1) * shard_size
+            loaded_weight = loaded_weight[start_idx:end_idx]
+            break
+    for p in row_parallel_weight_names:
+        if p in param_name:
+            shard_size = param.shape[1]
+            start_idx = tensor_model_parallel_rank * shard_size
+            end_idx = (tensor_model_parallel_rank + 1) * shard_size
+            loaded_weight = loaded_weight[:, start_idx:end_idx]
+            break
+    assert param.shape == loaded_weight.shape, (
+        f"{param_name} shape mismatch between model and checkpoint: "
+        f"{param.shape} != {loaded_weight.shape}")
     param.data.copy_(loaded_weight)
 
 
